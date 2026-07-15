@@ -627,6 +627,69 @@ async def zendesk_auth_status(params: AuthStatusInput) -> str:
         return _handle_error(e)
 
 
+
+# =============================================================================
+# Remote Read-only MCP Registry
+# =============================================================================
+
+REMOTE_READ_ONLY_TOOL_NAMES = {
+    "zendesk_get_ticket",
+    "zendesk_search",
+    "zendesk_get_ticket_details",
+    "zendesk_get_linked_incidents",
+    "zendesk_get_ticket_metrics",
+    "zendesk_list_ticket_metrics",
+    "zendesk_get_satisfaction_ratings",
+    "zendesk_get_satisfaction_rating",
+    "zendesk_list_views",
+    "zendesk_get_view_count",
+    "zendesk_get_view_tickets",
+    "zendesk_get_user",
+    "zendesk_search_users",
+    "zendesk_get_organization",
+    "zendesk_search_organizations",
+    "zendesk_talk_get_calls",
+    "zendesk_talk_get_legs",
+    "zendesk_talk_analytics",
+    "zendesk_list_groups",
+    "zendesk_list_tags",
+    "zendesk_list_sla_policies",
+    "zendesk_get_current_user",
+    "zendesk_auth_status",
+}
+
+KNOWN_WRITE_TOOL_NAMES = {
+    "zendesk_update_ticket",
+    "zendesk_create_ticket",
+    "zendesk_add_private_note",
+    "zendesk_add_public_note",
+}
+
+
+def _tool_names(server: FastMCP) -> set[str]:
+    return set(server._tool_manager._tools.keys())
+
+
+def create_remote_read_only_mcp() -> FastMCP:
+    """Create a dedicated remote MCP instance with only audited read-only tools."""
+    remote = FastMCP("zendesk_skill_read_only", instructions=security_instructions(_START, _END))
+    local_tools = mcp._tool_manager._tools
+    missing = REMOTE_READ_ONLY_TOOL_NAMES - set(local_tools.keys())
+    if missing:
+        raise RuntimeError(f"Remote read-only MCP allowlist references missing tools: {sorted(missing)}")
+
+    remote._tool_manager._tools.clear()
+    for tool_name in sorted(REMOTE_READ_ONLY_TOOL_NAMES):
+        remote._tool_manager._tools[tool_name] = local_tools[tool_name]
+
+    exposed_writes = KNOWN_WRITE_TOOL_NAMES & _tool_names(remote)
+    if exposed_writes:
+        raise RuntimeError(f"Remote read-only MCP accidentally exposes write tools: {sorted(exposed_writes)}")
+    return remote
+
+
+remote_mcp = create_remote_read_only_mcp()
+
 # =============================================================================
 # Server Entry Point
 # =============================================================================
@@ -660,9 +723,9 @@ def _run_remote_http() -> None:
     import uvicorn
 
     try:
-        app = mcp.streamable_http_app(path="/mcp")
+        app = remote_mcp.streamable_http_app(path="/mcp")
     except TypeError:
-        app = mcp.streamable_http_app()
+        app = remote_mcp.streamable_http_app()
     app.routes.append(Route("/.well-known/oauth-protected-resource", _oauth_protected_resource_route, methods=["GET"]))
     app.routes.append(Route("/.well-known/oauth-protected-resource/mcp", _oauth_protected_resource_route, methods=["GET"]))
     app.routes.append(Route("/.well-known/oauth-authorization-server", _oauth_authorization_server_route, methods=["GET"]))

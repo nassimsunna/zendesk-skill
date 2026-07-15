@@ -107,6 +107,7 @@ Expected behavior:
 
 ## 8. Confirm it remains read-only
 
+- The Claude Cowork remote `/mcp` endpoint uses a dedicated read-only MCP tool registry. It does not register ticket creation, ticket update, private/public comment, deletion, or other Zendesk mutation tools.
 - The Talk feature calls only:
   - `GET /api/v2/channels/voice/stats/incremental/calls`
   - `GET /api/v2/channels/voice/stats/incremental/legs`

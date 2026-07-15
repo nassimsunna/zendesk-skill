@@ -156,7 +156,7 @@ def test_streamable_http_app_routes_and_tools_registered(monkeypatch):
         called["path"] = path
         return fake_app
 
-    monkeypatch.setattr(server.mcp, "streamable_http_app", fake_streamable_http_app)
+    monkeypatch.setattr(server.remote_mcp, "streamable_http_app", fake_streamable_http_app)
     # _run_remote_http imports uvicorn inside the function, so patch the actual uvicorn module.
     import uvicorn
     monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
@@ -168,9 +168,9 @@ def test_streamable_http_app_routes_and_tools_registered(monkeypatch):
     assert "/.well-known/oauth-protected-resource" in route_paths
     assert "/.well-known/oauth-protected-resource/mcp" in route_paths
     assert "/.well-known/oauth-authorization-server" in route_paths
-    assert hasattr(server.mcp, "streamable_http_app")
+    assert hasattr(server.remote_mcp, "streamable_http_app")
 
-    tool_names = {tool.name for tool in server.mcp._tool_manager._tools.values()}
+    tool_names = {tool.name for tool in server.remote_mcp._tool_manager._tools.values()}
     assert "zendesk_talk_get_calls" in tool_names
     assert "zendesk_talk_get_legs" in tool_names
     assert "zendesk_talk_analytics" in tool_names
@@ -258,3 +258,43 @@ def test_invalid_authorization_headers_are_rejected(monkeypatch, header):
 
     assert valid is False
     assert reason in {"Bearer token required", "Malformed authorization header"}
+
+
+def test_remote_mcp_exposes_only_read_only_tool_allowlist():
+    from zendesk_skill import server
+
+    remote_tool_names = set(server.remote_mcp._tool_manager._tools.keys())
+
+    assert "zendesk_talk_get_calls" in remote_tool_names
+    assert "zendesk_talk_get_legs" in remote_tool_names
+    assert "zendesk_talk_analytics" in remote_tool_names
+    assert "zendesk_search" in remote_tool_names
+    assert "zendesk_get_ticket" in remote_tool_names
+    assert "zendesk_get_ticket_metrics" in remote_tool_names
+    assert "zendesk_get_satisfaction_ratings" in remote_tool_names
+    assert "zendesk_list_groups" in remote_tool_names
+    assert "zendesk_list_views" in remote_tool_names
+
+    forbidden = {
+        "zendesk_create_ticket",
+        "zendesk_update_ticket",
+        "zendesk_add_private_note",
+        "zendesk_add_public_note",
+    }
+    assert forbidden.isdisjoint(remote_tool_names)
+
+
+def test_remote_mcp_does_not_auto_expose_future_local_write_tools(monkeypatch):
+    from zendesk_skill import server
+
+    original_tools = dict(server.mcp._tool_manager._tools)
+    try:
+        existing_tool = next(iter(server.mcp._tool_manager._tools.values()))
+        server.mcp._tool_manager._tools["zendesk_delete_everything"] = existing_tool
+        rebuilt = server.create_remote_read_only_mcp()
+
+        assert "zendesk_delete_everything" not in rebuilt._tool_manager._tools
+        assert set(rebuilt._tool_manager._tools) == server.REMOTE_READ_ONLY_TOOL_NAMES
+    finally:
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(original_tools)
