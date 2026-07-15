@@ -129,3 +129,60 @@ def test_permission_errors_are_not_swallowed():
 
 def agent_leg(call_id, status, agent_id=1):
     return {"call_id": call_id, "type": "agent", "completion_status": status, "agent_id": agent_id}
+
+@pytest.mark.asyncio
+async def test_fetch_incremental_stops_when_count_zero_with_next_page(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {"calls": [], "count": 0, "next_page": "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=2"},
+        {"calls": [{"id": "should-not-fetch", "created_at": "2026-01-01T10:00:00Z"}], "count": 1, "next_page": None},
+    ])
+
+    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+
+    assert calls == []
+    assert len(client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_incremental_rejects_repeated_next_page_cursor(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    repeated = "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=2"
+    client = FakeClient([
+        {"calls": [{"id": 1, "created_at": "2026-01-01T10:00:00Z"}], "count": 1, "next_page": repeated},
+        {"calls": [{"id": 2, "created_at": "2026-01-01T11:00:00Z"}], "count": 1, "next_page": repeated},
+    ])
+
+    with pytest.raises(ZendeskAPIError, match="repeated next_page cursor"):
+        await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+
+
+def test_group_breakdown_uses_call_group_id():
+    from zendesk_skill.talk import breakdown, join_calls_and_legs
+
+    rows = join_calls_and_legs([
+        {"id": "c1", "call_group_id": 987654, "completion_status": "completed", "created_at": "2026-01-01T10:00:00Z"}
+    ], [])
+
+    grouped = breakdown(rows, "group")
+
+    assert grouped == [{"key": "987654", "count": 1, "outcomes": {"other": 1}}]
+
+
+def test_agent_prefixed_leg_completion_statuses():
+    assert summarize_leg(agent_leg("c1", "agent_missed"))["agent_missed"] is True
+    assert summarize_leg(agent_leg("c1", "agent_declined"))["agent_declined"] is True
+    assert summarize_leg(agent_leg("c1", "agent_transfer_declined"))["agent_declined"] is True
+
+
+def test_overflowed_boolean_takes_priority_over_completed_status():
+    assert classify_call({"id": "o1", "completion_status": "completed", "overflowed": True}, [])["outcome"] == "overflowed"
+    assert classify_call({"id": "o2", "completion_status": "completed", "overflowed": False}, [])["outcome"] == "other"
+    assert classify_call({"id": "v", "completion_status": "completed_voicemail", "overflowed": False}, [])["outcome"] == "voicemail"
+    assert classify_call({"id": "a", "completion_status": "completed", "overflowed": True, "talk_time": 120}, [agent_leg("a", "completed")])["outcome"] == "answered_by_agent"

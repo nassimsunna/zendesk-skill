@@ -123,9 +123,25 @@ async def fetch_incremental(client: ZendeskClient, endpoint: str, item_key: str,
     params: dict[str, Any] = {"start_time": _unix_seconds(start_date), "end_time": _unix_seconds(end_date)}
     items: list[dict[str, Any]] = []
     next_endpoint = endpoint
+    seen_pages: set[str] = set()
+    max_pages = 1000
+    pages_fetched = 0
     while next_endpoint:
+        pages_fetched += 1
+        if pages_fetched > max_pages:
+            raise ZendeskAPIError("Stopped Zendesk Talk pagination after 1000 pages to avoid an infinite loop.")
+
+        page_key = f"{next_endpoint}?{sorted(params.items()) if params else []}"
+        if page_key in seen_pages:
+            raise ZendeskAPIError("Stopped Zendesk Talk pagination because Zendesk returned a repeated next_page cursor.")
+        seen_pages.add(page_key)
+
         page = await _get_with_retry(client, next_endpoint, params=params)
-        items.extend(item for item in _items_from_response(page, item_key) if _in_range(item, start_dt, end_dt))
+        page_items = _items_from_response(page, item_key)
+        if page.get("count") == 0 or not page_items:
+            break
+
+        items.extend(item for item in page_items if _in_range(item, start_dt, end_dt))
         next_page = page.get("next_page")
         if next_page:
             next_endpoint, params = _endpoint_from_next_page(str(next_page), client)
@@ -167,6 +183,8 @@ def classify_call(call: dict[str, Any], legs: list[dict[str, Any]]) -> dict[str,
     outcome = "other"
     if answered_by_agent:
         outcome = "answered_by_agent"
+    elif call.get("overflowed") is True:
+        outcome = "overflowed"
     elif "abandoned" in status:
         if "ivr" in status:
             outcome = "abandoned_in_ivr"
@@ -191,7 +209,9 @@ def classify_call(call: dict[str, Any], legs: list[dict[str, Any]]) -> dict[str,
 def summarize_leg(leg: dict[str, Any]) -> dict[str, Any]:
     status = str(leg.get("completion_status") or leg.get("status") or "").lower()
     leg_type = str(leg.get("type") or leg.get("leg_type") or "").lower()
-    return {"agent_id": _agent_id(leg), "call_id": _leg_call_id(leg), "type": leg_type, "status": status, "agent_missed": status == "missed", "agent_declined": status == "declined", "agent_accepted": status == "accepted", "agent_completed": status == "completed"}
+    missed_statuses = {"missed", "agent_missed"}
+    declined_statuses = {"declined", "agent_declined", "agent_transfer_declined"}
+    return {"agent_id": _agent_id(leg), "call_id": _leg_call_id(leg), "type": leg_type, "status": status, "agent_missed": status in missed_statuses, "agent_declined": status in declined_statuses, "agent_accepted": status == "accepted", "agent_completed": status == "completed"}
 
 
 def join_calls_and_legs(calls: list[dict[str, Any]], legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -239,7 +259,7 @@ def breakdown(rows: list[dict[str, Any]], by: str) -> list[dict[str, Any]]:
         elif by == "phone_line":
             key = str(call.get("phone_line_id") or call.get("line_id") or call.get("from") or "unknown")
         elif by == "group":
-            key = str(call.get("group_id") or call.get("group_name") or "unknown")
+            key = str(call.get("call_group_id") or call.get("group_id") or call.get("group_name") or call.get("group") or "unknown")
         elif by == "agent":
             ids = sorted({summarize_leg(leg).get("agent_id") or "unknown" for leg in row["legs"] if str(leg.get("type") or leg.get("leg_type") or "").lower() == "agent"})
             key = ",".join(ids) if ids else "unknown"
