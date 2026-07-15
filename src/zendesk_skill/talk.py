@@ -167,12 +167,6 @@ def classify_call(call: dict[str, Any], legs: list[dict[str, Any]]) -> dict[str,
     outcome = "other"
     if answered_by_agent:
         outcome = "answered_by_agent"
-    elif "voicemail" in status:
-        outcome = "voicemail"
-    elif "overflow" in status:
-        outcome = "overflowed"
-    elif "failed" in status:
-        outcome = "failed"
     elif "abandoned" in status:
         if "ivr" in status:
             outcome = "abandoned_in_ivr"
@@ -184,6 +178,12 @@ def classify_call(call: dict[str, Any], legs: list[dict[str, Any]]) -> dict[str,
             outcome = "abandoned_in_voicemail"
         else:
             outcome = "abandoned"
+    elif "voicemail" in status:
+        outcome = "voicemail"
+    elif "overflow" in status:
+        outcome = "overflowed"
+    elif "failed" in status:
+        outcome = "failed"
 
     return {"outcome": outcome, "answered_by_agent": answered_by_agent, "zendesk_completion_status": call.get("completion_status") or call.get("status")}
 

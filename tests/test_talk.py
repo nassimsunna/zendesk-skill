@@ -105,8 +105,14 @@ async def test_429_honors_retry_after(monkeypatch):
     monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
     monkeypatch.setattr("zendesk_skill.talk.asyncio.sleep", fake_sleep)
     response = SimpleNamespace(headers={"Retry-After": "2"})
+
+    class HTTPStatusCause(Exception):
+        def __init__(self, response):
+            super().__init__("HTTP 429")
+            self.response = response
+
     err = ZendeskAPIError("rate limited", 429)
-    err.__cause__ = SimpleNamespace(response=response)
+    err.__cause__ = HTTPStatusCause(response)
     client = FakeClient([err, {"legs": [], "next_page": None}])
 
     legs = await fetch_incremental(client, LEGS_ENDPOINT, "legs", "2026-01-01", "2026-01-02")

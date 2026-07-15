@@ -157,9 +157,7 @@ def test_streamable_http_app_routes_and_tools_registered(monkeypatch):
         return fake_app
 
     monkeypatch.setattr(server.mcp, "streamable_http_app", fake_streamable_http_app)
-    monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None, raising=False)
-
-    # Import-time fallback: _run_remote_http imports uvicorn locally, so patch the module object too.
+    # _run_remote_http imports uvicorn inside the function, so patch the actual uvicorn module.
     import uvicorn
     monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
 
