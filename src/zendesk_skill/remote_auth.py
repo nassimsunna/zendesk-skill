@@ -17,6 +17,7 @@ from jwt import ExpiredSignatureError, InvalidAudienceError, InvalidIssuerError,
 from starlette.responses import JSONResponse, Response
 
 DEFAULT_REQUIRED_SCOPE = "zendesk:read"
+_JWKS_CLIENTS: dict[str, PyJWKClient] = {}
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,15 @@ def unauthorized_response(request: Any, error: str = "invalid_token", descriptio
     return JSONResponse({"error": error, "error_description": description}, status_code=401, headers={"WWW-Authenticate": header})
 
 
+def get_jwks_client(jwks_url: str) -> PyJWKClient:
+    """Return a cached JWKS client for a URL so provider keys are reused."""
+    client = _JWKS_CLIENTS.get(jwks_url)
+    if client is None:
+        client = PyJWKClient(jwks_url)
+        _JWKS_CLIENTS[jwks_url] = client
+    return client
+
+
 def _scope_values(claims: dict[str, Any]) -> set[str]:
     scope = claims.get("scope", "")
     scopes = set(scope.split()) if isinstance(scope, str) else set(scope or [])
@@ -152,7 +162,7 @@ def validate_oauth_bearer(authorization: str | None) -> tuple[bool, str]:
 
     token = authorization.removeprefix("Bearer ").strip()
     try:
-        signing_key = PyJWKClient(config.jwks_url).get_signing_key_from_jwt(token)
+        signing_key = get_jwks_client(config.jwks_url).get_signing_key_from_jwt(token)
         claims = jwt.decode(
             token,
             signing_key.key,

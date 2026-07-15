@@ -174,3 +174,51 @@ def test_streamable_http_app_routes_and_tools_registered(monkeypatch):
     assert "zendesk_talk_get_calls" in tool_names
     assert "zendesk_talk_get_legs" in tool_names
     assert "zendesk_talk_analytics" in tool_names
+
+
+def test_repeated_authentication_reuses_jwks_client(monkeypatch):
+    from zendesk_skill import remote_auth
+
+    oauth_env(monkeypatch)
+    remote_auth._JWKS_CLIENTS.clear()
+    created = []
+
+    class FakeJwksClient:
+        def __init__(self, url):
+            created.append(url)
+            self.url = url
+
+        def get_signing_key_from_jwt(self, token):
+            return SimpleNamespace(key="key")
+
+    monkeypatch.setattr(remote_auth, "PyJWKClient", FakeJwksClient)
+    monkeypatch.setattr(remote_auth.jwt, "decode", lambda *args, **kwargs: {"sub": "user-1", "email": "nassim@samedaycustom.example", "scope": "zendesk:read", "iss": "https://auth.example.com", "aud": "https://mcp.example.com/mcp", "exp": 9999999999})
+
+    assert remote_auth.validate_oauth_bearer("Bearer one") == (True, "ok")
+    assert remote_auth.validate_oauth_bearer("Bearer two") == (True, "ok")
+    assert created == ["https://auth.example.com/.well-known/jwks.json"]
+
+
+def test_different_jwks_urls_use_separate_clients(monkeypatch):
+    from zendesk_skill import remote_auth
+
+    oauth_env(monkeypatch)
+    remote_auth._JWKS_CLIENTS.clear()
+    created = []
+
+    class FakeJwksClient:
+        def __init__(self, url):
+            created.append(url)
+            self.url = url
+
+        def get_signing_key_from_jwt(self, token):
+            return SimpleNamespace(key="key")
+
+    monkeypatch.setattr(remote_auth, "PyJWKClient", FakeJwksClient)
+    monkeypatch.setattr(remote_auth.jwt, "decode", lambda *args, **kwargs: {"sub": "user-1", "email": "nassim@samedaycustom.example", "scope": "zendesk:read", "iss": "https://auth.example.com", "aud": "https://mcp.example.com/mcp", "exp": 9999999999})
+
+    assert remote_auth.validate_oauth_bearer("Bearer one") == (True, "ok")
+    monkeypatch.setenv("MCP_OAUTH_JWKS_URL", "https://auth2.example.com/.well-known/jwks.json")
+    assert remote_auth.validate_oauth_bearer("Bearer two") == (True, "ok")
+
+    assert created == ["https://auth.example.com/.well-known/jwks.json", "https://auth2.example.com/.well-known/jwks.json"]

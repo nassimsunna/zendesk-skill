@@ -186,3 +186,83 @@ def test_overflowed_boolean_takes_priority_over_completed_status():
     assert classify_call({"id": "o2", "completion_status": "completed", "overflowed": False}, [])["outcome"] == "other"
     assert classify_call({"id": "v", "completion_status": "completed_voicemail", "overflowed": False}, [])["outcome"] == "voicemail"
     assert classify_call({"id": "a", "completion_status": "completed", "overflowed": True, "talk_time": 120}, [agent_leg("a", "completed")])["outcome"] == "answered_by_agent"
+
+@pytest.mark.asyncio
+async def test_fetch_incremental_does_not_send_unsupported_end_time_and_stops_after_requested_end(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [
+                {"id": "in-range", "created_at": "2026-01-10T10:00:00Z"},
+                {"id": "after-end", "created_at": "2026-01-11T00:00:00Z"},
+            ],
+            "count": 2,
+            "end_time": 1768089600,
+            "next_page": "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=2",
+        },
+        {
+            "calls": [{"id": "should-not-download", "created_at": "2026-01-12T00:00:00Z"}],
+            "count": 1,
+            "next_page": None,
+        },
+    ])
+
+    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-10", "2026-01-10")
+
+    assert [call["id"] for call in calls] == ["in-range"]
+    assert client.requests == [(CALLS_ENDPOINT, {"start_time": 1768003200})]
+
+
+@pytest.mark.asyncio
+async def test_date_only_end_date_includes_entire_final_day_and_excludes_next_day(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [
+                {"id": "final-day", "created_at": "2026-01-31T23:59:59Z"},
+                {"id": "next-day", "created_at": "2026-02-01T00:00:00Z"},
+            ],
+            "count": 2,
+            "next_page": None,
+        },
+    ])
+
+    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-31")
+
+    assert [call["id"] for call in calls] == ["final-day"]
+
+
+@pytest.mark.asyncio
+async def test_datetime_end_date_keeps_exact_exclusive_boundary(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [
+                {"id": "before-boundary", "created_at": "2026-01-31T11:59:59Z"},
+                {"id": "at-boundary", "created_at": "2026-01-31T12:00:00Z"},
+            ],
+            "count": 2,
+            "next_page": None,
+        },
+    ])
+
+    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-31T00:00:00Z", "2026-01-31T12:00:00Z")
+
+    assert [call["id"] for call in calls] == ["before-boundary"]
+
+
+def test_join_uses_ivr_time_spent_as_primary_ivr_duration():
+    row = join_calls_and_legs([
+        {"id": "c1", "completion_status": "completed", "ivr_time_spent": 42, "ivr_time": 3, "ivr_time_in_seconds": 2}
+    ], [])[0]
+
+    assert row["metrics"]["ivr_time"] == 42

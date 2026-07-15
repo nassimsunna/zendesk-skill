@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
@@ -49,6 +49,24 @@ def parse_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _is_date_only(value: str) -> bool:
+    stripped = value.strip()
+    return len(stripped) == 10 and stripped[4] == "-" and stripped[7] == "-"
+
+
+def parse_end_datetime(value: str) -> datetime:
+    """Parse an end date as an exclusive upper bound.
+
+    Date-only values include the whole requested day by advancing to the next
+    midnight. Full datetime values keep their exact instant as the exclusive
+    boundary.
+    """
+    parsed = parse_datetime(value)
+    if _is_date_only(value):
+        return parsed + timedelta(days=1)
+    return parsed
+
+
 def _unix_seconds(value: str) -> int:
     return int(parse_datetime(value).timestamp())
 
@@ -67,9 +85,9 @@ def _record_datetime(record: dict[str, Any]) -> datetime | None:
     return None
 
 
-def _in_range(record: dict[str, Any], start: datetime, end: datetime) -> bool:
+def _in_range(record: dict[str, Any], start: datetime, end_exclusive: datetime) -> bool:
     when = _record_datetime(record)
-    return when is None or start <= when <= end
+    return when is None or start <= when < end_exclusive
 
 
 def _items_from_response(data: dict[str, Any], item_key: str) -> list[dict[str, Any]]:
@@ -113,14 +131,24 @@ async def _get_with_retry(client: ZendeskClient, endpoint: str, params: dict[str
         raise
 
 
+def _page_reaches_end(page: dict[str, Any], page_items: list[dict[str, Any]], end_exclusive: datetime) -> bool:
+    response_end_time = page.get("end_time")
+    if isinstance(response_end_time, (int, float)):
+        if datetime.fromtimestamp(response_end_time, tz=timezone.utc) >= end_exclusive:
+            return True
+
+    record_times = [when for item in page_items if (when := _record_datetime(item)) is not None]
+    return bool(record_times and max(record_times) >= end_exclusive)
+
+
 async def fetch_incremental(client: ZendeskClient, endpoint: str, item_key: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
     """Fetch a read-only Talk incremental endpoint across safe next_page pagination."""
     start_dt = parse_datetime(start_date)
-    end_dt = parse_datetime(end_date)
-    if end_dt < start_dt:
+    end_dt = parse_end_datetime(end_date)
+    if end_dt <= start_dt:
         raise ValueError("end_date must be after start_date")
 
-    params: dict[str, Any] = {"start_time": _unix_seconds(start_date), "end_time": _unix_seconds(end_date)}
+    params: dict[str, Any] = {"start_time": _unix_seconds(start_date)}
     items: list[dict[str, Any]] = []
     next_endpoint = endpoint
     seen_pages: set[str] = set()
@@ -142,6 +170,8 @@ async def fetch_incremental(client: ZendeskClient, endpoint: str, item_key: str,
             break
 
         items.extend(item for item in page_items if _in_range(item, start_dt, end_dt))
+        if _page_reaches_end(page, page_items, end_dt):
+            break
         next_page = page.get("next_page")
         if next_page:
             next_endpoint, params = _endpoint_from_next_page(str(next_page), client)
@@ -234,7 +264,7 @@ def join_calls_and_legs(calls: list[dict[str, Any]], legs: list[dict[str, Any]])
             "metrics": {
                 "queue_wait_time": _duration(call, "queue_wait_time", "queue_wait_time_in_seconds", "wait_time"),
                 "time_to_answer": _duration(call, "time_to_answer", "time_to_answer_in_seconds"),
-                "ivr_time": _duration(call, "ivr_time", "ivr_time_in_seconds"),
+                "ivr_time": _duration(call, "ivr_time_spent", "ivr_time", "ivr_time_in_seconds"),
                 "talk_time": _duration(call, "talk_time", "talk_time_in_seconds"),
                 "hold_time": _duration(call, "hold_time", "hold_time_in_seconds"),
                 "wrap_up_time": _duration(call, "wrap_up_time", "wrap_up_time_in_seconds"),
