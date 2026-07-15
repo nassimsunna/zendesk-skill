@@ -1,6 +1,12 @@
 """Zendesk MCP Server - Thin wrapper around operations module."""
 
 import json
+import os
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
@@ -9,6 +15,11 @@ from zendesk_skill import operations
 from zendesk_skill.client import ZendeskAuthError, ZendeskAPIError
 from zendesk_skill.queries import execute_jq, get_query
 from zendesk_skill.storage import load_response
+from zendesk_skill.remote_auth import (
+    authorization_server_metadata_response,
+    metadata_response,
+    remote_auth_response,
+)
 from zendesk_skill.utils.security import generate_markers, security_instructions, wrap_external_data, is_security_enabled
 
 # Generate session markers once at server startup and register them.
@@ -170,6 +181,15 @@ class SatisfactionRatingsInput(BaseModel):
     per_page: int = Field(default=25, ge=1, le=100, description="Results per page")
     output_path: str | None = Field(default=None, description="Custom output path")
 
+
+
+class TalkAnalyticsInput(BaseModel):
+    """Input for Zendesk Talk analytics queries."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    start_date: str = Field(..., description="Start date/time, for example 2026-01-01 or 2026-01-01T00:00:00Z")
+    end_date: str = Field(..., description="End date/time, for example 2026-01-31 or 2026-01-31T23:59:59Z")
+    breakdown_by: str | None = Field(default=None, description="Comma-separated breakdowns: agent, group, date, hour, phone_line, outcome")
+    output_path: str | None = Field(default=None, description="Custom output path")
 
 class AuthStatusInput(BaseModel):
     """Input for auth status check."""
@@ -509,6 +529,41 @@ async def zendesk_search_organizations(params: SearchQueryInput) -> str:
 
 
 # =============================================================================
+# Zendesk Talk Read-only Analytics Tools
+# =============================================================================
+
+
+@mcp.tool(name="zendesk_talk_get_calls")
+async def zendesk_talk_get_calls(params: TalkAnalyticsInput) -> str:
+    """Retrieve read-only Zendesk Talk calls for a requested start and end date."""
+    try:
+        result = await operations.get_talk_calls(params.start_date, params.end_date, params.output_path)
+        return _format_result(result)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(name="zendesk_talk_get_legs")
+async def zendesk_talk_get_legs(params: TalkAnalyticsInput) -> str:
+    """Retrieve read-only Zendesk Talk call legs for a requested start and end date."""
+    try:
+        result = await operations.get_talk_legs(params.start_date, params.end_date, params.output_path)
+        return _format_result(result)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(name="zendesk_talk_analytics")
+async def zendesk_talk_analytics(params: TalkAnalyticsInput) -> str:
+    """Join Talk calls to legs/tickets, classify outcomes, metrics, agent leg statuses, and breakdowns."""
+    try:
+        result = await operations.get_talk_analytics(params.start_date, params.end_date, params.breakdown_by, params.output_path)
+        return _format_result(result)
+    except Exception as e:
+        return _handle_error(e)
+
+
+# =============================================================================
 # Config Tools
 # =============================================================================
 
@@ -577,9 +632,50 @@ async def zendesk_auth_status(params: AuthStatusInput) -> str:
 # =============================================================================
 
 
+async def _oauth_protected_resource_route(request: Request) -> JSONResponse:
+    """OAuth protected-resource metadata for MCP clients."""
+    return metadata_response(request)
+
+
+async def _oauth_authorization_server_route(request: Request) -> JSONResponse:
+    """Authorization-server metadata for pre-registered OAuth clients."""
+    return authorization_server_metadata_response(request)
+
+
+class _RemoteAuthMiddleware(BaseHTTPMiddleware):
+    """OAuth 2.1 resource-server protection for remote MCP; /health and metadata are public."""
+
+    async def dispatch(self, request: Request, call_next):
+        auth_response = remote_auth_response(
+            request,
+            request.headers.get("authorization"),
+        )
+        if auth_response is not None:
+            return auth_response
+        return await call_next(request)
+
+
+def _run_remote_http() -> None:
+    """Run Streamable HTTP MCP on /mcp for remote Claude Cowork deployments."""
+    import uvicorn
+
+    try:
+        app = mcp.streamable_http_app(path="/mcp")
+    except TypeError:
+        app = mcp.streamable_http_app()
+    app.routes.append(Route("/.well-known/oauth-protected-resource", _oauth_protected_resource_route, methods=["GET"]))
+    app.routes.append(Route("/.well-known/oauth-protected-resource/mcp", _oauth_protected_resource_route, methods=["GET"]))
+    app.routes.append(Route("/.well-known/oauth-authorization-server", _oauth_authorization_server_route, methods=["GET"]))
+    app.add_middleware(_RemoteAuthMiddleware)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+
+
 def main():
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server locally by default, or remote Streamable HTTP with MCP_TRANSPORT=http."""
+    if os.environ.get("MCP_TRANSPORT", "stdio").lower() in {"http", "streamable-http"}:
+        _run_remote_http()
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

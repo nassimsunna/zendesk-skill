@@ -1325,3 +1325,70 @@ def slack_logout() -> dict:
 
 # Backward-compatible re-exports from reporting module
 from zendesk_skill.reporting import send_slack_report, generate_markdown_report  # noqa: E402, F401
+
+# =============================================================================
+# Zendesk Talk Read-only Analytics Operations
+# =============================================================================
+
+async def get_talk_calls(start_date: str, end_date: str, output_path: str | None = None) -> dict:
+    """Retrieve read-only Zendesk Talk incremental call records."""
+    from zendesk_skill.talk import CALLS_ENDPOINT, fetch_incremental
+
+    client = _get_client()
+    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    payload = {"calls": calls, "read_only": True}
+    file_path, _ = save_response("talk_calls", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
+    return {"count": len(calls), "calls": calls, "file_path": str(file_path), "read_only": True}
+
+
+async def get_talk_legs(start_date: str, end_date: str, output_path: str | None = None) -> dict:
+    """Retrieve read-only Zendesk Talk incremental call leg records."""
+    from zendesk_skill.talk import LEGS_ENDPOINT, fetch_incremental
+
+    client = _get_client()
+    legs = await fetch_incremental(client, LEGS_ENDPOINT, "legs", start_date, end_date)
+    payload = {"legs": legs, "read_only": True}
+    file_path, _ = save_response("talk_legs", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
+    return {"count": len(legs), "legs": legs, "file_path": str(file_path), "read_only": True}
+
+
+async def get_talk_analytics(
+    start_date: str,
+    end_date: str,
+    breakdown_by: str | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """Retrieve calls and legs, join them, classify outcomes, and optionally break down results."""
+    from zendesk_skill.talk import CALLS_ENDPOINT, LEGS_ENDPOINT, breakdown, fetch_incremental, join_calls_and_legs, summarize_leg
+
+    client = _get_client()
+    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    legs = await fetch_incremental(client, LEGS_ENDPOINT, "legs", start_date, end_date)
+    rows = join_calls_and_legs(calls, legs)
+    allowed_breakdowns = {"agent", "group", "date", "hour", "phone_line", "outcome"}
+    breakdowns = {}
+    if breakdown_by:
+        requested = [part.strip() for part in breakdown_by.split(",") if part.strip()]
+    else:
+        requested = sorted(allowed_breakdowns)
+    for name in requested:
+        if name not in allowed_breakdowns:
+            raise ValueError(f"Unsupported breakdown: {name}. Choose from {', '.join(sorted(allowed_breakdowns))}.")
+        breakdowns[name] = breakdown(rows, name)
+
+    leg_summaries = [summarize_leg(leg) for leg in legs]
+    payload = {
+        "calls": calls,
+        "legs": legs,
+        "joined_calls": rows,
+        "leg_summaries": leg_summaries,
+        "breakdowns": breakdowns,
+        "read_only": True,
+        "notes": [
+            "Agent-answered calls require talk time plus a completed agent leg; completed alone is not enough.",
+            "Original Zendesk completion status is preserved in classification.zendesk_completion_status.",
+            "IVR data is limited to fields returned by Zendesk; this does not provide a complete IVR keypress path.",
+        ],
+    }
+    file_path, _ = save_response("talk_analytics", {"start_date": start_date, "end_date": end_date, "breakdown_by": breakdown_by}, payload, output_path=output_path)
+    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": breakdowns, "joined_calls": rows, "file_path": str(file_path), "read_only": True}
