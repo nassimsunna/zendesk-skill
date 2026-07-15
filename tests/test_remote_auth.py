@@ -222,3 +222,39 @@ def test_different_jwks_urls_use_separate_clients(monkeypatch):
     assert remote_auth.validate_oauth_bearer("Bearer two") == (True, "ok")
 
     assert created == ["https://auth.example.com/.well-known/jwks.json", "https://auth2.example.com/.well-known/jwks.json"]
+
+
+def test_bearer_scheme_is_case_insensitive_and_preserves_token(monkeypatch):
+    from zendesk_skill import remote_auth
+
+    oauth_env(monkeypatch)
+    remote_auth._JWKS_CLIENTS.clear()
+    seen_tokens = []
+
+    class FakeJwksClient:
+        def __init__(self, url):
+            self.url = url
+
+        def get_signing_key_from_jwt(self, token):
+            seen_tokens.append(token)
+            return SimpleNamespace(key="key")
+
+    monkeypatch.setattr(remote_auth, "PyJWKClient", FakeJwksClient)
+    monkeypatch.setattr(remote_auth.jwt, "decode", lambda *args, **kwargs: {"sub": "user-1", "email": "nassim@samedaycustom.example", "scope": "zendesk:read", "iss": "https://auth.example.com", "aud": "https://mcp.example.com/mcp", "exp": 9999999999})
+
+    assert remote_auth.validate_oauth_bearer("Bearer Token-Exact") == (True, "ok")
+    assert remote_auth.validate_oauth_bearer("bearer Token-Exact") == (True, "ok")
+    assert remote_auth.validate_oauth_bearer("BEARER Token-Exact") == (True, "ok")
+    assert seen_tokens == ["Token-Exact", "Token-Exact", "Token-Exact"]
+
+
+@pytest.mark.parametrize("header", [None, "Bearer", "Bearer ", "Basic token", "Bearer token extra", " Bearer token"])
+def test_invalid_authorization_headers_are_rejected(monkeypatch, header):
+    from zendesk_skill import remote_auth
+
+    oauth_env(monkeypatch)
+
+    valid, reason = remote_auth.validate_oauth_bearer(header)
+
+    assert valid is False
+    assert reason in {"Bearer token required", "Malformed authorization header"}

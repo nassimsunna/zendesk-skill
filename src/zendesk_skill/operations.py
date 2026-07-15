@@ -1326,6 +1326,81 @@ def slack_logout() -> dict:
 # Backward-compatible re-exports from reporting module
 from zendesk_skill.reporting import send_slack_report, generate_markdown_report  # noqa: E402, F401
 
+
+# Text fields from Zendesk Talk are untrusted LLM-facing content. Keep raw
+# records in saved files, but wrap/redact direct MCP results.
+_TALK_SENSITIVE_FIELDS = {
+    "from",
+    "to",
+    "caller_id",
+    "caller_phone_number",
+    "customer_phone_number",
+    "recording_url",
+    "recording",
+    "recording_urls",
+    "transcript",
+    "transcript_url",
+    "voicemail_url",
+    "voicemail_recording_url",
+}
+
+_TALK_SAFE_STRING_FIELDS = {
+    "id",
+    "call_id",
+    "ticket_id",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "call_started_at",
+    "completion_status",
+    "status",
+    "type",
+    "leg_type",
+    "outcome",
+    "zendesk_completion_status",
+}
+
+_TALK_TEXT_FIELD_HINTS = (
+    "name",
+    "nickname",
+    "sip",
+    "address",
+    "line",
+    "group",
+    "ivr",
+    "destination",
+    "phone_number",
+)
+
+
+def _sanitize_talk_for_llm(value, source_id: str = "talk"):
+    """Wrap untrusted Talk text before returning it to the LLM.
+
+    Raw Zendesk Talk responses are still saved to disk by save_response. Direct
+    MCP returns keep IDs, timestamps, booleans, and metrics usable while wrapping
+    Zendesk-controlled text fields and redacting customer recordings/transcripts
+    or caller phone fields by default.
+    """
+    if isinstance(value, list):
+        return [_sanitize_talk_for_llm(item, source_id) for item in value]
+    if isinstance(value, dict):
+        record_id = str(value.get("id") or value.get("call_id") or source_id)
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            field_source = f"{record_id}:{key}"
+            if key_text in _TALK_SENSITIVE_FIELDS:
+                sanitized[key] = "[redacted]" if item is not None else None
+            elif isinstance(item, str) and (
+                any(hint in key_text for hint in _TALK_TEXT_FIELD_HINTS)
+                or (key_text not in _TALK_SAFE_STRING_FIELDS and not key_text.endswith("_id"))
+            ):
+                sanitized[key] = wrap_field_simple(item, "talk", field_source, *get_session_markers())
+            else:
+                sanitized[key] = _sanitize_talk_for_llm(item, field_source)
+        return sanitized
+    return value
+
 # =============================================================================
 # Zendesk Talk Read-only Analytics Operations
 # =============================================================================
@@ -1338,7 +1413,7 @@ async def get_talk_calls(start_date: str, end_date: str, output_path: str | None
     calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", start_date, end_date)
     payload = {"calls": calls, "read_only": True}
     file_path, _ = save_response("talk_calls", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
-    return {"count": len(calls), "calls": calls, "file_path": str(file_path), "read_only": True}
+    return {"count": len(calls), "calls": _sanitize_talk_for_llm(calls), "file_path": str(file_path), "read_only": True}
 
 
 async def get_talk_legs(start_date: str, end_date: str, output_path: str | None = None) -> dict:
@@ -1349,7 +1424,7 @@ async def get_talk_legs(start_date: str, end_date: str, output_path: str | None 
     legs = await fetch_incremental(client, LEGS_ENDPOINT, "legs", start_date, end_date)
     payload = {"legs": legs, "read_only": True}
     file_path, _ = save_response("talk_legs", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
-    return {"count": len(legs), "legs": legs, "file_path": str(file_path), "read_only": True}
+    return {"count": len(legs), "legs": _sanitize_talk_for_llm(legs), "file_path": str(file_path), "read_only": True}
 
 
 async def get_talk_analytics(
@@ -1391,4 +1466,4 @@ async def get_talk_analytics(
         ],
     }
     file_path, _ = save_response("talk_analytics", {"start_date": start_date, "end_date": end_date, "breakdown_by": breakdown_by}, payload, output_path=output_path)
-    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": breakdowns, "joined_calls": rows, "file_path": str(file_path), "read_only": True}
+    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": _sanitize_talk_for_llm(breakdowns), "joined_calls": _sanitize_talk_for_llm(rows), "file_path": str(file_path), "read_only": True}

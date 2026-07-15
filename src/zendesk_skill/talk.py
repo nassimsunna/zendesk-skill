@@ -287,7 +287,7 @@ def breakdown(rows: list[dict[str, Any]], by: str) -> list[dict[str, Any]]:
         elif by == "outcome":
             key = row["classification"]["outcome"]
         elif by == "phone_line":
-            key = str(call.get("phone_line_id") or call.get("line_id") or call.get("from") or "unknown")
+            key = str(call.get("phone_number_id") or call.get("phone_number") or call.get("phone_line_id") or call.get("line_id") or call.get("line_name") or "unknown")
         elif by == "group":
             key = str(call.get("call_group_id") or call.get("group_id") or call.get("group_name") or call.get("group") or "unknown")
         elif by == "agent":

@@ -152,15 +152,29 @@ def _subject_allowed(claims: dict[str, Any], config: OAuthConfig) -> bool:
     return True
 
 
+def _extract_bearer_token(authorization: str | None) -> tuple[str | None, str | None]:
+    if not authorization:
+        return None, "Bearer token required"
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None, "Malformed authorization header"
+    scheme, token = parts[0], parts[1]
+    if scheme.lower() != "bearer":
+        return None, "Bearer token required"
+    if token.strip() != token or not token or any(char.isspace() for char in token):
+        return None, "Malformed authorization header"
+    return token, None
+
+
 def validate_oauth_bearer(authorization: str | None) -> tuple[bool, str]:
     """Validate an OAuth bearer JWT for issuer, audience, expiration, scope, and allowed user/account."""
     config = get_oauth_config()
     if not config.configured_for_oauth:
         return False, "OAuth is not configured for this MCP server"
-    if not authorization or not authorization.startswith("Bearer "):
-        return False, "Bearer token required"
+    token, token_error = _extract_bearer_token(authorization)
+    if token_error:
+        return False, token_error
 
-    token = authorization.removeprefix("Bearer ").strip()
     try:
         signing_key = get_jwks_client(config.jwks_url).get_signing_key_from_jwt(token)
         claims = jwt.decode(
