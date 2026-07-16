@@ -298,3 +298,69 @@ def test_remote_mcp_does_not_auto_expose_future_local_write_tools(monkeypatch):
     finally:
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(original_tools)
+
+
+def test_remote_mcp_tool_schemas_do_not_expose_filesystem_path_fields():
+    from zendesk_skill import server
+
+    forbidden = server.REMOTE_FORBIDDEN_SCHEMA_FIELDS
+    remote_input_models = [
+        server.RemoteOutputOnlyInput,
+        server.RemoteTicketIdInput,
+        server.RemoteViewIdInput,
+        server.RemoteUserIdInput,
+        server.RemoteOrgIdInput,
+        server.RemoteRatingIdInput,
+        server.RemoteSearchQueryInput,
+        server.RemoteSearchInput,
+        server.RemotePaginatedInput,
+        server.RemoteViewTicketsInput,
+        server.RemoteSatisfactionRatingsInput,
+        server.RemoteTalkAnalyticsInput,
+        server.RemoteAuthStatusInput,
+    ]
+
+    for model in remote_input_models:
+        assert forbidden.isdisjoint(model.model_fields.keys())
+        assert model.model_config.get("extra") == "forbid"
+
+
+def test_remote_schema_rejects_caller_controlled_output_path():
+    from pydantic import ValidationError
+    from zendesk_skill import server
+
+    with pytest.raises(ValidationError):
+        server.RemoteTalkAnalyticsInput(start_date="2026-01-01", end_date="2026-01-02", output_path="/tmp/evil.json")
+
+
+def test_remote_schema_rejects_absolute_and_traversal_path_fields():
+    from pydantic import ValidationError
+    from zendesk_skill import server
+
+    with pytest.raises(ValidationError):
+        server.RemoteTicketIdInput(ticket_id="123", output_path="/etc/passwd")
+    with pytest.raises(ValidationError):
+        server.RemoteTicketIdInput(ticket_id="123", file_path="../escape.json")
+    with pytest.raises(ValidationError):
+        server.RemoteTicketIdInput(ticket_id="123", directory_path="../escape")
+
+
+def test_remote_generated_storage_path_stays_inside_remote_storage_dir(tmp_path, monkeypatch):
+    from pathlib import Path
+    from zendesk_skill import server
+
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(tmp_path))
+
+    generated = Path(server._remote_output_path("talk_calls")).resolve()
+
+    assert tmp_path.resolve() in generated.parents
+    assert generated.name.startswith("talk_calls-")
+    assert generated.suffix == ".json"
+    assert not generated.exists()
+
+
+def test_local_stdio_schemas_still_allow_output_path():
+    from zendesk_skill import server
+
+    assert "output_path" in server.TalkAnalyticsInput.model_fields
+    assert "output_path" in server.TicketIdInput.model_fields
