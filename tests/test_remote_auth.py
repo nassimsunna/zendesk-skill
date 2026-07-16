@@ -152,8 +152,8 @@ def test_streamable_http_app_routes_and_tools_registered(monkeypatch):
     fake_app = FakeApp()
     called = {}
 
-    def fake_streamable_http_app(path="/mcp"):
-        called["path"] = path
+    def fake_streamable_http_app():
+        called["created"] = True
         return fake_app
 
     monkeypatch.setattr(server.remote_mcp, "streamable_http_app", fake_streamable_http_app)
@@ -163,7 +163,7 @@ def test_streamable_http_app_routes_and_tools_registered(monkeypatch):
 
     server._run_remote_http()
 
-    assert called["path"] == "/mcp"
+    assert called["created"] is True
     route_paths = {route.path for route in fake_app.routes}
     assert "/.well-known/oauth-protected-resource" in route_paths
     assert "/.well-known/oauth-protected-resource/mcp" in route_paths
@@ -364,3 +364,59 @@ def test_local_stdio_schemas_still_allow_output_path():
 
     assert "output_path" in server.TalkAnalyticsInput.model_fields
     assert "output_path" in server.TicketIdInput.model_fields
+
+
+def test_fastmcp_exposes_streamable_http_app():
+    from mcp.server.fastmcp import FastMCP
+
+    assert callable(getattr(FastMCP("compatibility-check"), "streamable_http_app", None))
+
+
+def test_remote_streamable_http_app_can_be_created():
+    from zendesk_skill import server
+
+    server._ensure_streamable_http_compatible(server.remote_mcp)
+    app = server.remote_mcp.streamable_http_app()
+
+    assert app is not None
+
+
+def test_startup_compatibility_check_reports_missing_streamable_http(monkeypatch):
+    from zendesk_skill import server
+
+    monkeypatch.setattr(server, "package_version", lambda package: "1.8.0")
+
+    with pytest.raises(RuntimeError, match="FastMCP.streamable_http_app"):
+        server._ensure_streamable_http_compatible(SimpleNamespace())
+
+
+def test_startup_compatibility_check_rejects_incompatible_mcp_versions(monkeypatch):
+    from zendesk_skill import server
+
+    fake_server = SimpleNamespace(streamable_http_app=lambda: object())
+    monkeypatch.setattr(server, "package_version", lambda package: "1.7.1")
+    with pytest.raises(RuntimeError, match=r"mcp\[cli\]>=1.8.0,<2"):
+        server._ensure_streamable_http_compatible(fake_server)
+
+    monkeypatch.setattr(server, "package_version", lambda package: "2.0.0")
+    with pytest.raises(RuntimeError, match=r"mcp\[cli\]>=1.8.0,<2"):
+        server._ensure_streamable_http_compatible(fake_server)
+
+
+def test_pyproject_requires_streamable_http_compatible_mcp_v1():
+    import tomllib
+    from pathlib import Path
+
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+    dependencies = pyproject["project"]["dependencies"]
+    mcp_dependencies = [dependency for dependency in dependencies if dependency.startswith("mcp[cli]")]
+
+    assert mcp_dependencies == ["mcp[cli]>=1.8.0,<2"]
+    dependency = mcp_dependencies[0]
+    assert ">=1.6" not in dependency
+    assert ">=1.8.0" in dependency
+    assert "<2" in dependency
+
+    lock_text = Path("uv.lock").read_text()
+    assert 'specifier = ">=1.8.0,<2"' in lock_text
+    assert 'specifier = ">=1.6.0"' not in lock_text

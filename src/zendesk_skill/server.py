@@ -2,6 +2,7 @@
 
 import json
 import os
+from importlib.metadata import PackageNotFoundError, version as package_version
 import tempfile
 import uuid
 from pathlib import Path
@@ -24,6 +25,43 @@ from zendesk_skill.remote_auth import (
     remote_auth_response,
 )
 from zendesk_skill.utils.security import generate_markers, security_instructions, wrap_external_data, is_security_enabled
+
+
+MCP_MIN_STREAMABLE_HTTP_VERSION = "1.8.0"
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts = []
+    for part in value.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if digits == "":
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _ensure_streamable_http_compatible(server: FastMCP) -> None:
+    """Fail clearly if the installed MCP SDK cannot serve Streamable HTTP."""
+    streamable_http_app = getattr(server, "streamable_http_app", None)
+    if not callable(streamable_http_app):
+        try:
+            installed = package_version("mcp")
+        except PackageNotFoundError:
+            installed = "unknown"
+        raise RuntimeError(
+            "The installed MCP Python SDK does not expose FastMCP.streamable_http_app(). "
+            f"Install mcp[cli]>={MCP_MIN_STREAMABLE_HTTP_VERSION},<2. Installed version: {installed}."
+        )
+
+    try:
+        installed = package_version("mcp")
+    except PackageNotFoundError:
+        return
+    if _version_tuple(installed) < _version_tuple(MCP_MIN_STREAMABLE_HTTP_VERSION) or _version_tuple(installed) >= (2,):
+        raise RuntimeError(
+            f"Unsupported MCP Python SDK version {installed}. "
+            f"Remote Streamable HTTP requires mcp[cli]>={MCP_MIN_STREAMABLE_HTTP_VERSION},<2."
+        )
 
 # Generate session markers once at server startup and register them.
 # The markers are delivered to the LLM via MCP InitializeResult.instructions
@@ -993,10 +1031,8 @@ def _run_remote_http() -> None:
     """Run Streamable HTTP MCP on /mcp for remote Claude Cowork deployments."""
     import uvicorn
 
-    try:
-        app = remote_mcp.streamable_http_app(path="/mcp")
-    except TypeError:
-        app = remote_mcp.streamable_http_app()
+    _ensure_streamable_http_compatible(remote_mcp)
+    app = remote_mcp.streamable_http_app()
     app.routes.append(Route("/.well-known/oauth-protected-resource", _oauth_protected_resource_route, methods=["GET"]))
     app.routes.append(Route("/.well-known/oauth-protected-resource/mcp", _oauth_protected_resource_route, methods=["GET"]))
     app.routes.append(Route("/.well-known/oauth-authorization-server", _oauth_authorization_server_route, methods=["GET"]))
