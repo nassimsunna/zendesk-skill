@@ -1407,24 +1407,28 @@ def _sanitize_talk_for_llm(value, source_id: str = "talk"):
 
 async def get_talk_calls(start_date: str, end_date: str, output_path: str | None = None) -> dict:
     """Retrieve read-only Zendesk Talk incremental call records."""
-    from zendesk_skill.talk import CALLS_ENDPOINT, fetch_incremental
+    from zendesk_skill.talk import CALLS_ENDPOINT, fetch_incremental_with_metadata
 
     client = _get_client()
-    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", start_date, end_date)
-    payload = {"calls": calls, "read_only": True}
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    calls = result["calls"]
+    metadata = result["metadata"]
+    payload = {"calls": calls, "metadata": metadata, "read_only": True}
     file_path, _ = save_response("talk_calls", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
-    return {"count": len(calls), "calls": _sanitize_talk_for_llm(calls), "file_path": str(file_path), "read_only": True}
+    return {"count": len(calls), "calls": _sanitize_talk_for_llm(calls), "metadata": metadata, "file_path": str(file_path), "read_only": True}
 
 
 async def get_talk_legs(start_date: str, end_date: str, output_path: str | None = None) -> dict:
     """Retrieve read-only Zendesk Talk incremental call leg records."""
-    from zendesk_skill.talk import LEGS_ENDPOINT, fetch_incremental
+    from zendesk_skill.talk import LEGS_ENDPOINT, fetch_incremental_with_metadata
 
     client = _get_client()
-    legs = await fetch_incremental(client, LEGS_ENDPOINT, "legs", start_date, end_date)
-    payload = {"legs": legs, "read_only": True}
+    result = await fetch_incremental_with_metadata(client, LEGS_ENDPOINT, "legs", start_date, end_date)
+    legs = result["legs"]
+    metadata = result["metadata"]
+    payload = {"legs": legs, "metadata": metadata, "read_only": True}
     file_path, _ = save_response("talk_legs", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
-    return {"count": len(legs), "legs": _sanitize_talk_for_llm(legs), "file_path": str(file_path), "read_only": True}
+    return {"count": len(legs), "legs": _sanitize_talk_for_llm(legs), "metadata": metadata, "file_path": str(file_path), "read_only": True}
 
 
 async def get_talk_analytics(
@@ -1434,11 +1438,13 @@ async def get_talk_analytics(
     output_path: str | None = None,
 ) -> dict:
     """Retrieve calls and legs, join them, classify outcomes, and optionally break down results."""
-    from zendesk_skill.talk import CALLS_ENDPOINT, LEGS_ENDPOINT, breakdown, fetch_incremental, join_calls_and_legs, summarize_leg
+    from zendesk_skill.talk import CALLS_ENDPOINT, LEGS_ENDPOINT, breakdown, fetch_incremental_with_metadata, join_calls_and_legs, summarize_leg
 
     client = _get_client()
-    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", start_date, end_date)
-    legs = await fetch_incremental(client, LEGS_ENDPOINT, "legs", start_date, end_date)
+    calls_result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    legs_result = await fetch_incremental_with_metadata(client, LEGS_ENDPOINT, "legs", start_date, end_date)
+    calls = calls_result["calls"]
+    legs = legs_result["legs"]
     rows = join_calls_and_legs(calls, legs)
     allowed_breakdowns = {"agent", "group", "date", "hour", "phone_line", "outcome"}
     breakdowns = {}
@@ -1458,6 +1464,7 @@ async def get_talk_analytics(
         "joined_calls": rows,
         "leg_summaries": leg_summaries,
         "breakdowns": breakdowns,
+        "metadata": {"calls": calls_result["metadata"], "legs": legs_result["metadata"]},
         "read_only": True,
         "notes": [
             "Agent-answered calls require talk time plus a completed agent leg; completed alone is not enough.",
@@ -1466,4 +1473,4 @@ async def get_talk_analytics(
         ],
     }
     file_path, _ = save_response("talk_analytics", {"start_date": start_date, "end_date": end_date, "breakdown_by": breakdown_by}, payload, output_path=output_path)
-    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": _sanitize_talk_for_llm(breakdowns), "joined_calls": _sanitize_talk_for_llm(rows), "file_path": str(file_path), "read_only": True}
+    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": _sanitize_talk_for_llm(breakdowns), "joined_calls": _sanitize_talk_for_llm(rows), "metadata": payload["metadata"], "file_path": str(file_path), "read_only": True}

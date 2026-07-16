@@ -14,6 +14,7 @@ from zendesk_skill.client import ZendeskAPIError, ZendeskClient
 CALLS_ENDPOINT = "channels/voice/stats/incremental/calls"
 LEGS_ENDPOINT = "channels/voice/stats/incremental/legs"
 REQUEST_INTERVAL_SECONDS = 6.0  # Zendesk Talk incremental stats limit: 10 requests/minute.
+MAX_INCREMENTAL_PAGES = 1000
 
 
 @dataclass
@@ -141,8 +142,26 @@ def _page_reaches_end(page: dict[str, Any], page_items: list[dict[str, Any]], en
     return bool(record_times and max(record_times) >= end_exclusive)
 
 
-async def fetch_incremental(client: ZendeskClient, endpoint: str, item_key: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
-    """Fetch a read-only Talk incremental endpoint across safe next_page pagination."""
+def _stable_record_key(record: dict[str, Any], item_key: str) -> str | None:
+    if item_key == "calls":
+        candidates = ("id", "call_id")
+    elif item_key == "legs":
+        candidates = ("id", "leg_id", "call_leg_id")
+    else:
+        candidates = ("id",)
+    for candidate in candidates:
+        value = record.get(candidate)
+        if value is not None:
+            return f"{item_key}:{value}"
+    return None
+
+
+def _page_key(endpoint: str, params: dict[str, Any] | None) -> str:
+    return f"{endpoint}?{sorted(params.items()) if params else []}"
+
+
+async def fetch_incremental_with_metadata(client: ZendeskClient, endpoint: str, item_key: str, start_date: str, end_date: str) -> dict[str, Any]:
+    """Fetch a Talk incremental endpoint and include safe pagination metadata."""
     start_dt = parse_datetime(start_date)
     end_dt = parse_end_datetime(end_date)
     if end_dt <= start_dt:
@@ -150,34 +169,79 @@ async def fetch_incremental(client: ZendeskClient, endpoint: str, item_key: str,
 
     params: dict[str, Any] = {"start_time": _unix_seconds(start_date)}
     items: list[dict[str, Any]] = []
+    seen_record_keys: set[str] = set()
     next_endpoint = endpoint
     seen_pages: set[str] = set()
-    max_pages = 1000
     pages_fetched = 0
+    reached_live_tail = False
+    requested_end_reached = False
+    empty_page_completion = False
+    termination_reason = "no_next_page"
+
     while next_endpoint:
         pages_fetched += 1
-        if pages_fetched > max_pages:
-            raise ZendeskAPIError("Stopped Zendesk Talk pagination after 1000 pages to avoid an infinite loop.")
+        if pages_fetched > MAX_INCREMENTAL_PAGES:
+            raise ZendeskAPIError(f"Stopped Zendesk Talk pagination after {MAX_INCREMENTAL_PAGES} pages to avoid an infinite loop.")
 
-        page_key = f"{next_endpoint}?{sorted(params.items()) if params else []}"
+        page_key = _page_key(next_endpoint, params)
         if page_key in seen_pages:
-            raise ZendeskAPIError("Stopped Zendesk Talk pagination because Zendesk returned a repeated next_page cursor.")
+            reached_live_tail = True
+            termination_reason = "live_tail_repeated_cursor"
+            break
         seen_pages.add(page_key)
 
         page = await _get_with_retry(client, next_endpoint, params=params)
         page_items = _items_from_response(page, item_key)
         if page.get("count") == 0 or not page_items:
+            empty_page_completion = True
+            termination_reason = "empty_page"
             break
 
-        items.extend(item for item in page_items if _in_range(item, start_dt, end_dt))
+        for item in page_items:
+            if not _in_range(item, start_dt, end_dt):
+                continue
+            record_key = _stable_record_key(item, item_key)
+            if record_key is not None:
+                if record_key in seen_record_keys:
+                    continue
+                seen_record_keys.add(record_key)
+            items.append(item)
+
         if _page_reaches_end(page, page_items, end_dt):
+            requested_end_reached = True
+            termination_reason = "requested_end_reached"
             break
+
         next_page = page.get("next_page")
         if next_page:
-            next_endpoint, params = _endpoint_from_next_page(str(next_page), client)
+            candidate_endpoint, candidate_params = _endpoint_from_next_page(str(next_page), client)
+            candidate_key = _page_key(candidate_endpoint, candidate_params)
+            if candidate_key in seen_pages:
+                reached_live_tail = True
+                termination_reason = "live_tail_repeated_cursor"
+                break
+            next_endpoint, params = candidate_endpoint, candidate_params
         else:
+            termination_reason = "no_next_page"
             next_endpoint = ""
-    return items
+
+    return {
+        item_key: items,
+        "metadata": {
+            "reached_live_tail": reached_live_tail,
+            "pages_fetched": pages_fetched,
+            "records_returned": len(items),
+            "requested_end_reached": requested_end_reached,
+            "empty_page_completion": empty_page_completion,
+            "termination_reason": termination_reason,
+        },
+    }
+
+
+async def fetch_incremental(client: ZendeskClient, endpoint: str, item_key: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
+    """Fetch a read-only Talk incremental endpoint across safe next_page pagination."""
+    result = await fetch_incremental_with_metadata(client, endpoint, item_key, start_date, end_date)
+    return result[item_key]
 
 
 def _duration(record: dict[str, Any], *names: str) -> int | float | None:

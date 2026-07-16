@@ -9,6 +9,7 @@ from zendesk_skill.talk import (
     _endpoint_from_next_page,
     classify_call,
     fetch_incremental,
+    fetch_incremental_with_metadata,
     join_calls_and_legs,
     summarize_leg,
     breakdown,
@@ -149,7 +150,7 @@ async def test_fetch_incremental_stops_when_count_zero_with_next_page(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_fetch_incremental_rejects_repeated_next_page_cursor(monkeypatch):
+async def test_repeated_cursor_at_live_tail_returns_collected_records(monkeypatch):
     async def no_wait():
         return None
 
@@ -158,10 +159,55 @@ async def test_fetch_incremental_rejects_repeated_next_page_cursor(monkeypatch):
     client = FakeClient([
         {"calls": [{"id": 1, "created_at": "2026-01-01T10:00:00Z"}], "count": 1, "next_page": repeated},
         {"calls": [{"id": 2, "created_at": "2026-01-01T11:00:00Z"}], "count": 1, "next_page": repeated},
+        {"calls": [{"id": "should-not-fetch", "created_at": "2026-01-01T12:00:00Z"}], "count": 1, "next_page": None},
     ])
 
-    with pytest.raises(ZendeskAPIError, match="repeated next_page cursor"):
-        await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")
+
+    assert [call["id"] for call in result["calls"]] == [1, 2]
+    assert result["metadata"]["reached_live_tail"] is True
+    assert result["metadata"]["termination_reason"] == "live_tail_repeated_cursor"
+    assert result["metadata"]["pages_fetched"] == 2
+    assert result["metadata"]["records_returned"] == 2
+    assert len(client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_cursor_deduplicates_records(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    repeated = "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=2"
+    client = FakeClient([
+        {"calls": [{"id": "same", "created_at": "2026-01-01T10:00:00Z"}], "count": 1, "next_page": repeated},
+        {"calls": [{"id": "same", "created_at": "2026-01-01T10:00:00Z"}], "count": 1, "next_page": repeated},
+    ])
+
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
+
+    assert [call["id"] for call in result["calls"]] == ["same"]
+    assert result["metadata"]["records_returned"] == 1
+    assert result["metadata"]["reached_live_tail"] is True
+
+
+@pytest.mark.asyncio
+async def test_end_date_after_newest_available_call_succeeds_at_live_tail(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    repeated = "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=tail"
+    client = FakeClient([
+        {"calls": [{"id": "newest", "created_at": "2026-07-16T09:00:00Z"}], "count": 1, "next_page": repeated},
+        {"calls": [{"id": "newest", "created_at": "2026-07-16T09:00:00Z"}], "count": 1, "next_page": repeated},
+    ])
+
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", "2026-07-16", "2026-07-17")
+
+    assert [call["id"] for call in result["calls"]] == ["newest"]
+    assert result["metadata"]["reached_live_tail"] is True
+    assert result["metadata"]["requested_end_reached"] is False
 
 
 def test_group_breakdown_uses_call_group_id():
@@ -351,3 +397,73 @@ def test_talk_sanitizer_uses_existing_external_trust_markers(monkeypatch):
         assert sanitized[field]["data"] == record[field]
     assert sanitized["talk_time"] == 45
     assert sanitized["overflowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_incremental_metadata_marks_empty_page_completion(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {"calls": [], "count": 0, "next_page": "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=2"},
+    ])
+
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
+
+    assert result["calls"] == []
+    assert result["metadata"]["empty_page_completion"] is True
+    assert result["metadata"]["termination_reason"] == "empty_page"
+
+
+@pytest.mark.asyncio
+async def test_fetch_incremental_rejects_unsafe_next_page_during_fetch(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [{"id": "safe", "created_at": "2026-01-01T10:00:00Z"}],
+            "count": 1,
+            "next_page": "https://attacker.example.com/api/v2/channels/voice/stats/incremental/calls?page=2",
+        },
+    ])
+
+    with pytest.raises(ZendeskAPIError, match="unsafe Zendesk pagination URL"):
+        await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
+
+
+@pytest.mark.asyncio
+async def test_fetch_incremental_rejects_malformed_next_page_during_fetch(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [{"id": "safe", "created_at": "2026-01-01T10:00:00Z"}],
+            "count": 1,
+            "next_page": "not-a-url",
+        },
+    ])
+
+    with pytest.raises(ZendeskAPIError, match="unsafe Zendesk pagination URL"):
+        await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
+
+
+@pytest.mark.asyncio
+async def test_fetch_incremental_maximum_page_protection_remains_active(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    monkeypatch.setattr("zendesk_skill.talk.MAX_INCREMENTAL_PAGES", 2)
+    client = FakeClient([
+        {"calls": [{"id": "p1", "created_at": "2026-01-01T10:00:00Z"}], "count": 1, "next_page": "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=2"},
+        {"calls": [{"id": "p2", "created_at": "2026-01-01T11:00:00Z"}], "count": 1, "next_page": "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=3"},
+        {"calls": [{"id": "p3", "created_at": "2026-01-01T12:00:00Z"}], "count": 1, "next_page": None},
+    ])
+
+    with pytest.raises(ZendeskAPIError, match="after 2 pages"):
+        await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
