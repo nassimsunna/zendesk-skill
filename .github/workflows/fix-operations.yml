@@ -1,0 +1,116 @@
+name: Fix Talk sanitizer structure
+
+on:
+  push:
+    branches:
+      - codex/add-read-only-zendesk-talk-analytics-support-kjz66e
+    paths:
+      - .github/workflows/fix-operations.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/add-read-only-zendesk-talk-analytics-support-kjz66e
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Repair operations.py
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/zendesk_skill/operations.py")
+          text = path.read_text()
+          start = text.index("def _sanitize_talk_for_llm(")
+          end = text.index("async def get_talk_legs(", start)
+
+          replacement = '''def _sanitize_talk_for_llm(value, source_id: str = "talk"):
+              """Wrap untrusted Talk text before returning it to the LLM.
+
+              Stored Zendesk Talk responses and direct MCP returns redact unnecessary
+              sensitive fields. Direct MCP returns keep IDs, timestamps, booleans, and
+              metrics usable while wrapping Zendesk-controlled text fields and redacting
+              customer recordings/transcripts or caller phone fields by default.
+              """
+              if isinstance(value, list):
+                  return [_sanitize_talk_for_llm(item, source_id) for item in value]
+              if isinstance(value, dict):
+                  record_id = str(value.get("id") or value.get("call_id") or source_id)
+                  sanitized = {}
+                  for key, item in value.items():
+                      key_text = str(key).lower()
+                      field_source = f"{record_id}:{key}"
+                      if _is_sensitive_talk_field(key_text, item):
+                          sanitized[key] = "[redacted]" if item is not None else None
+                      elif (
+                          isinstance(item, str)
+                          and key_text not in _TALK_SAFE_STRING_FIELDS
+                          and not key_text.endswith("_id")
+                      ):
+                          sanitized[key] = wrap_field_simple(
+                              item,
+                              "talk",
+                              field_source,
+                              *get_session_markers(),
+                          )
+                      else:
+                          sanitized[key] = _sanitize_talk_for_llm(item, field_source)
+                  return sanitized
+              return value
+
+
+          # =============================================================================
+          # Zendesk Talk Read-only Analytics Operations
+          # =============================================================================
+
+          async def get_talk_calls(
+              start_date: str,
+              end_date: str,
+              output_path: str | None = None,
+          ) -> dict:
+              """Retrieve read-only Zendesk Talk incremental call records."""
+              from zendesk_skill.talk import CALLS_ENDPOINT, fetch_incremental_with_metadata
+
+              client = _get_client()
+              result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+              calls = result["calls"]
+              metadata = result["metadata"]
+              payload = {"calls": _minimize_talk_for_storage(calls), "metadata": metadata, "read_only": True}
+              file_path, _ = save_response(
+                  "talk_calls",
+                  {"start_date": start_date, "end_date": end_date},
+                  payload,
+                  output_path=output_path,
+              )
+              return {
+                  "count": len(calls),
+                  "calls": _sanitize_talk_for_llm(calls),
+                  "metadata": metadata,
+                  "file_path": str(file_path),
+                  "read_only": True,
+              }
+
+
+          '''
+
+          path.write_text(text[:start] + replacement + text[end:])
+          PY
+
+      - name: Validate Python syntax
+        run: python -m py_compile src/zendesk_skill/operations.py
+
+      - name: Commit repair and remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/zendesk_skill/operations.py
+          git rm .github/workflows/fix-operations.yml
+          git commit -m "Fix Talk sanitizer structure"
+          git push origin HEAD:codex/add-read-only-zendesk-talk-analytics-support-kjz66e
