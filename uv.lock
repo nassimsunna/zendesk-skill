@@ -1390,8 +1390,11 @@ dependencies = [
     { name = "mistune" },
     { name = "prompt-security-utils" },
     { name = "pydantic" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "rich" },
+    { name = "starlette" },
     { name = "typer" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -1404,12 +1407,15 @@ dev = [
 requires-dist = [
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.8.0,<2" },
     { name = "mistune", specifier = ">=3.0.0" },
     { name = "prompt-security-utils", specifier = ">=1.4.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8.0" },
     { name = "rich", specifier = ">=13.0.0" },
+    { name = "starlette", specifier = ">=0.37.0" },
     { name = "typer", specifier = ">=0.9.0" },
+    { name = "uvicorn", specifier = ">=0.29.0" },
 ]
 
 [package.metadata.requires-dev]

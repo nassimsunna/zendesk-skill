@@ -3,7 +3,7 @@
 This module contains all Zendesk API interaction logic used by both
 the CLI and MCP server. All functions are async and return dicts.
 """
-
+import re
 import tempfile
 from pathlib import Path
 
@@ -1325,3 +1325,214 @@ def slack_logout() -> dict:
 
 # Backward-compatible re-exports from reporting module
 from zendesk_skill.reporting import send_slack_report, generate_markdown_report  # noqa: E402, F401
+
+
+# Text fields from Zendesk Talk are untrusted LLM-facing content. Stored
+# responses and direct MCP results redact unnecessary sensitive fields.
+_TALK_SENSITIVE_FIELDS = {
+    "from",
+    "to",
+    "caller_id",
+    "caller_phone_number",
+    "customer_phone_number",
+    "caller_number",
+    "customer_number",
+    "external_number",
+    "callback_number",
+    "forwarded_to",
+    "overflowed_to",
+    "ivr_routed_to",
+    "recording_url",
+    "recording",
+    "recording_urls",
+    "transcript",
+    "transcript_url",
+    "voicemail_url",
+    "voicemail_recording_url",
+}
+
+_TALK_SAFE_STRING_FIELDS = {
+    "id",
+    "call_id",
+    "ticket_id",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "call_started_at",
+    "completion_status",
+    "status",
+    "type",
+    "leg_type",
+    "outcome",
+    "zendesk_completion_status",
+}
+
+_TALK_PHONE_NUMBER_RE = re.compile(r"^\+?[0-9][0-9 .()\-]{6,}[0-9]$")
+
+
+def _looks_like_phone_number(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    digits = [character for character in stripped if character.isdigit()]
+    return len(digits) >= 7 and bool(_TALK_PHONE_NUMBER_RE.match(stripped))
+
+
+def _is_sensitive_talk_field(key: str, value) -> bool:
+    key_text = str(key).lower()
+    if key_text in _TALK_SENSITIVE_FIELDS:
+        return True
+    return key_text in {"phone_number", "line"} and _looks_like_phone_number(value)
+
+
+_TALK_TEXT_FIELD_HINTS = (
+    "name",
+    "nickname",
+    "sip",
+    "address",
+    "line",
+    "group",
+    "ivr",
+    "destination",
+    "phone_number",
+)
+
+
+def _minimize_talk_for_storage(value):
+    """Redact unnecessary sensitive Talk fields before writing response files."""
+    if isinstance(value, list):
+        return [_minimize_talk_for_storage(item) for item in value]
+    if isinstance(value, dict):
+        minimized = {}
+        for key, item in value.items():
+            if _is_sensitive_talk_field(str(key), item):
+                minimized[key] = "[redacted]" if item is not None else None
+            else:
+                minimized[key] = _minimize_talk_for_storage(item)
+        return minimized
+    return value
+
+
+def _sanitize_talk_for_llm(value, source_id: str = "talk"):
+    """Wrap untrusted Talk text before returning it to the LLM.
+
+    Stored Zendesk Talk responses and direct MCP returns redact unnecessary
+    sensitive fields. Direct MCP returns keep IDs, timestamps, booleans, and
+    metrics usable while wrapping Zendesk-controlled text fields and redacting
+    customer recordings/transcripts or caller phone fields by default.
+    """
+    if isinstance(value, list):
+        return [_sanitize_talk_for_llm(item, source_id) for item in value]
+    if isinstance(value, dict):
+        record_id = str(value.get("id") or value.get("call_id") or source_id)
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            field_source = f"{record_id}:{key}"
+            if _is_sensitive_talk_field(key_text, item):
+                sanitized[key] = "[redacted]" if item is not None else None
+            elif (
+                isinstance(item, str)
+                and key_text not in _TALK_SAFE_STRING_FIELDS
+                and not key_text.endswith("_id")
+            ):
+                sanitized[key] = wrap_field_simple(
+                    item,
+                    "talk",
+                    field_source,
+                    *get_session_markers(),
+                )
+            else:
+                sanitized[key] = _sanitize_talk_for_llm(item, field_source)
+        return sanitized
+    return value
+
+
+# =============================================================================
+# Zendesk Talk Read-only Analytics Operations
+# =============================================================================
+
+async def get_talk_calls(
+    start_date: str,
+    end_date: str,
+    output_path: str | None = None,
+) -> dict:
+    """Retrieve read-only Zendesk Talk incremental call records."""
+    from zendesk_skill.talk import CALLS_ENDPOINT, fetch_incremental_with_metadata
+
+    client = _get_client()
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    calls = result["calls"]
+    metadata = result["metadata"]
+    payload = {"calls": _minimize_talk_for_storage(calls), "metadata": metadata, "read_only": True}
+    file_path, _ = save_response(
+        "talk_calls",
+        {"start_date": start_date, "end_date": end_date},
+        payload,
+        output_path=output_path,
+    )
+    return {
+        "count": len(calls),
+        "calls": _sanitize_talk_for_llm(calls),
+        "metadata": metadata,
+        "file_path": str(file_path),
+        "read_only": True,
+    }
+
+
+async def get_talk_legs(start_date: str, end_date: str, output_path: str | None = None) -> dict:
+    """Retrieve read-only Zendesk Talk incremental call leg records."""
+    from zendesk_skill.talk import LEGS_ENDPOINT, fetch_incremental_with_metadata
+
+    client = _get_client()
+    result = await fetch_incremental_with_metadata(client, LEGS_ENDPOINT, "legs", start_date, end_date)
+    legs = result["legs"]
+    metadata = result["metadata"]
+    payload = {"legs": _minimize_talk_for_storage(legs), "metadata": metadata, "read_only": True}
+    file_path, _ = save_response("talk_legs", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
+    return {"count": len(legs), "legs": _sanitize_talk_for_llm(legs), "metadata": metadata, "file_path": str(file_path), "read_only": True}
+
+
+async def get_talk_analytics(
+    start_date: str,
+    end_date: str,
+    breakdown_by: str | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """Retrieve calls and legs, join them, classify outcomes, and optionally break down results."""
+    from zendesk_skill.talk import CALLS_ENDPOINT, breakdown, fetch_incremental_with_metadata, fetch_relevant_legs_for_calls, join_calls_and_legs, summarize_leg
+
+    client = _get_client()
+    calls_result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    calls = calls_result["calls"]
+    legs_result = await fetch_relevant_legs_for_calls(client, calls, start_date, end_date)
+    legs = legs_result["legs"]
+    rows = join_calls_and_legs(calls, legs)
+    allowed_breakdowns = {"agent", "group", "date", "hour", "phone_line", "outcome"}
+    breakdowns = {}
+    if breakdown_by:
+        requested = [part.strip() for part in breakdown_by.split(",") if part.strip()]
+    else:
+        requested = sorted(allowed_breakdowns)
+    for name in requested:
+        if name not in allowed_breakdowns:
+            raise ValueError(f"Unsupported breakdown: {name}. Choose from {', '.join(sorted(allowed_breakdowns))}.")
+        breakdowns[name] = breakdown(rows, name)
+
+    leg_summaries = [summarize_leg(leg) for leg in legs]
+    payload = {
+        "calls": _minimize_talk_for_storage(calls),
+        "legs": _minimize_talk_for_storage(legs),
+        "joined_calls": _minimize_talk_for_storage(rows),
+        "leg_summaries": leg_summaries,
+        "breakdowns": _minimize_talk_for_storage(breakdowns),
+        "metadata": {"calls": calls_result["metadata"], "legs": legs_result["metadata"]},
+        "read_only": True,
+        "notes": [
+            "Agent-answered calls require talk time plus a completed agent leg; completed alone is not enough.",
+            "Original Zendesk completion status is preserved in classification.zendesk_completion_status.",
+            "IVR data is limited to fields returned by Zendesk; this does not provide a complete IVR keypress path.",
+        ],
+    }
+    file_path, _ = save_response("talk_analytics", {"start_date": start_date, "end_date": end_date, "breakdown_by": breakdown_by}, payload, output_path=output_path)
+    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": _sanitize_talk_for_llm(breakdowns), "joined_calls": _sanitize_talk_for_llm(rows), "metadata": payload["metadata"], "file_path": str(file_path), "read_only": True}
