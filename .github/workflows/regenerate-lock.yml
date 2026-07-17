@@ -1,7 +1,12 @@
 name: Regenerate uv.lock
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - codex/add-read-only-zendesk-talk-analytics-support
+    paths:
+      - pyproject.toml
+      - .github/workflows/regenerate-lock.yml
 
 permissions:
   contents: write
