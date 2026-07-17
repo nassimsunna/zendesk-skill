@@ -1,0 +1,45 @@
+name: Regenerate uv.lock
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate-lock:
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'codex/add-read-only-zendesk-talk-analytics-support'
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/add-read-only-zendesk-talk-analytics-support
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Regenerate uv.lock
+        run: uv lock
+
+      - name: Verify lockfile is in sync
+        run: uv lock --check
+
+      - name: Commit regenerated lockfile only
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already in sync"
+            exit 0
+          fi
+          git add uv.lock
+          git diff --cached --name-only | grep -qx "uv.lock"
+          git commit -m "Regenerate uv lockfile"
+          git push origin HEAD:codex/add-read-only-zendesk-talk-analytics-support
