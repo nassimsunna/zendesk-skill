@@ -98,6 +98,16 @@ Expected behavior:
 - The integration should only read Zendesk data.
 - Results should include a saved local response path in the service container and grouped counts.
 
+
+## 6A. Understand Talk date windows
+
+There are two different dates in Zendesk Talk reports:
+
+- **Data retrieval/update window**: the start and end dates tell Zendesk which Talk records were created or updated during that export window. This catches older calls that were completed or updated later.
+- **Call occurrence/reporting window**: date and hour breakdowns use when the customer actually called, such as `started_at` or `call_started_at`, not the later `updated_at` value.
+
+This means an older call updated today can be retrieved for audit completeness, but it will still be grouped under the day/hour when the call actually happened. It will not be counted as a brand-new call today just because Zendesk updated the record today.
+
 ## 7. Revoke access
 
 1. In Zendesk Admin Center, open **Apps and integrations → Zendesk API**.

@@ -467,3 +467,151 @@ async def test_fetch_incremental_maximum_page_protection_remains_active(monkeypa
 
     with pytest.raises(ZendeskAPIError, match="after 2 pages"):
         await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
+
+
+@pytest.mark.asyncio
+async def test_call_created_before_export_start_but_updated_inside_window_is_retrieved(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [
+                {
+                    "id": "updated-call",
+                    "created_at": "2025-12-31T23:00:00Z",
+                    "updated_at": "2026-01-01T10:00:00Z",
+                    "started_at": "2025-12-31T23:30:00Z",
+                }
+            ],
+            "count": 1,
+            "next_page": None,
+        }
+    ])
+
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
+
+    assert [call["id"] for call in result["calls"]] == ["updated-call"]
+    assert result["metadata"]["records_returned"] == 1
+
+
+def test_date_breakdown_groups_updated_call_by_started_at_not_updated_at():
+    rows = join_calls_and_legs([
+        {
+            "id": "updated-call",
+            "created_at": "2025-12-31T22:00:00Z",
+            "updated_at": "2026-01-01T10:00:00Z",
+            "started_at": "2025-12-31T23:30:00Z",
+        }
+    ], [])
+
+    assert breakdown(rows, "date") == [{"key": "2025-12-31", "count": 1, "outcomes": {"other": 1}}]
+
+
+@pytest.mark.asyncio
+async def test_call_created_and_started_inside_export_window_remains_included(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [
+                {
+                    "id": "new-call",
+                    "created_at": "2026-01-01T09:00:00Z",
+                    "updated_at": "2026-01-01T09:15:00Z",
+                    "started_at": "2026-01-01T09:00:00Z",
+                }
+            ],
+            "count": 1,
+            "next_page": None,
+        }
+    ])
+
+    calls = await fetch_incremental(client, CALLS_ENDPOINT, "calls", "2026-01-01", "2026-01-02")
+
+    assert [call["id"] for call in calls] == ["new-call"]
+
+
+def test_updated_old_call_is_not_grouped_as_occurring_inside_update_window():
+    rows = join_calls_and_legs([
+        {
+            "id": "old-call",
+            "created_at": "2025-12-31T20:00:00Z",
+            "updated_at": "2026-01-01T12:00:00Z",
+            "started_at": "2025-12-31T20:05:00Z",
+        }
+    ], [])
+
+    grouped = breakdown(rows, "date")
+
+    assert grouped == [{"key": "2025-12-31", "count": 1, "outcomes": {"other": 1}}]
+    assert all(bucket["key"] != "2026-01-01" for bucket in grouped)
+
+
+@pytest.mark.asyncio
+async def test_leg_created_before_export_start_but_updated_inside_window_is_retrieved(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "legs": [
+                {
+                    "id": "leg-1",
+                    "call_id": "call-1",
+                    "created_at": "2025-12-31T23:00:00Z",
+                    "updated_at": "2026-01-01T10:00:00Z",
+                    "started_at": "2025-12-31T23:01:00Z",
+                }
+            ],
+            "count": 1,
+            "next_page": None,
+        }
+    ])
+
+    legs = await fetch_incremental(client, LEGS_ENDPOINT, "legs", "2026-01-01", "2026-01-02")
+
+    assert [leg["id"] for leg in legs] == ["leg-1"]
+
+
+@pytest.mark.asyncio
+async def test_pagination_uses_updated_at_for_progress_and_continues(monkeypatch):
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr("zendesk_skill.talk._rate_limiter.wait", no_wait)
+    client = FakeClient([
+        {
+            "calls": [
+                {
+                    "id": "page-1",
+                    "created_at": "2025-12-30T10:00:00Z",
+                    "updated_at": "2026-01-01T10:00:00Z",
+                    "started_at": "2025-12-30T10:05:00Z",
+                }
+            ],
+            "count": 1,
+            "next_page": "https://example.zendesk.com/api/v2/channels/voice/stats/incremental/calls?page=2",
+        },
+        {
+            "calls": [
+                {
+                    "id": "page-2",
+                    "created_at": "2025-12-30T11:00:00Z",
+                    "updated_at": "2026-01-01T11:00:00Z",
+                    "started_at": "2025-12-30T11:05:00Z",
+                }
+            ],
+            "count": 1,
+            "next_page": None,
+        },
+    ])
+
+    result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", "2026-01-01T00:00:00Z", "2026-01-01T12:00:00Z")
+
+    assert [call["id"] for call in result["calls"]] == ["page-1", "page-2"]
+    assert result["metadata"]["pages_fetched"] == 2

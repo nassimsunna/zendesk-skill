@@ -72,22 +72,53 @@ def _unix_seconds(value: str) -> int:
     return int(parse_datetime(value).timestamp())
 
 
-def _record_datetime(record: dict[str, Any]) -> datetime | None:
-    for field in ("created_at", "started_at", "updated_at", "call_started_at", "time"):
+def _first_datetime_field(record: dict[str, Any], fields: tuple[str, ...], numeric_fields: tuple[str, ...] = ()) -> datetime | None:
+    for field in fields:
         value = record.get(field)
         if isinstance(value, str):
             try:
                 return parse_datetime(value)
             except ValueError:
                 continue
-    timestamp = record.get("timestamp") or record.get("start_time")
-    if isinstance(timestamp, (int, float)):
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    for field in numeric_fields:
+        value = record.get(field)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
     return None
 
 
-def _in_range(record: dict[str, Any], start: datetime, end_exclusive: datetime) -> bool:
-    when = _record_datetime(record)
+def _export_datetime(record: dict[str, Any]) -> datetime | None:
+    """Timestamp used for incremental export retrieval and pagination progress.
+
+    Zendesk Talk incremental exports are driven by records created or updated
+    since start_time. This is intentionally separate from reporting time so an
+    old call updated in the export window is retrieved without pretending that
+    the customer called at the update time.
+    """
+    return _first_datetime_field(
+        record,
+        ("updated_at", "created_at", "modified_at", "last_updated_at"),
+        ("updated_timestamp", "timestamp"),
+    )
+
+
+def _reporting_datetime(record: dict[str, Any], item_key: str = "calls") -> datetime | None:
+    """Timestamp used for call occurrence reporting and date/hour breakdowns."""
+    if item_key == "legs":
+        return _first_datetime_field(
+            record,
+            ("started_at", "leg_started_at", "call_started_at", "created_at", "time"),
+            ("start_time", "timestamp"),
+        )
+    return _first_datetime_field(
+        record,
+        ("started_at", "call_started_at", "created_at", "time"),
+        ("start_time", "timestamp"),
+    )
+
+
+def _in_export_range(record: dict[str, Any], start: datetime, end_exclusive: datetime) -> bool:
+    when = _export_datetime(record)
     return when is None or start <= when < end_exclusive
 
 
@@ -138,7 +169,7 @@ def _page_reaches_end(page: dict[str, Any], page_items: list[dict[str, Any]], en
         if datetime.fromtimestamp(response_end_time, tz=timezone.utc) >= end_exclusive:
             return True
 
-    record_times = [when for item in page_items if (when := _record_datetime(item)) is not None]
+    record_times = [when for item in page_items if (when := _export_datetime(item)) is not None]
     return bool(record_times and max(record_times) >= end_exclusive)
 
 
@@ -198,7 +229,7 @@ async def fetch_incremental_with_metadata(client: ZendeskClient, endpoint: str, 
             break
 
         for item in page_items:
-            if not _in_range(item, start_dt, end_dt):
+            if not _in_export_range(item, start_dt, end_dt):
                 continue
             record_key = _stable_record_key(item, item_key)
             if record_key is not None:
@@ -342,7 +373,7 @@ def breakdown(rows: list[dict[str, Any]], by: str) -> list[dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = {}
     for row in rows:
         call = row["call"]
-        when = _record_datetime(call)
+        when = _reporting_datetime(call, "calls")
         key = "unknown"
         if by == "date" and when:
             key = when.date().isoformat()
