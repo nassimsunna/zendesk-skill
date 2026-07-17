@@ -2,6 +2,8 @@
 
 import json
 import os
+import stat
+import time
 from importlib.metadata import PackageNotFoundError, version as package_version
 import tempfile
 import uuid
@@ -792,21 +794,80 @@ def _tool_names(server: FastMCP) -> set[str]:
     return set(server._tool_manager._tools.keys())
 
 
+REMOTE_STORAGE_DIR_MODE = 0o700
+REMOTE_STORAGE_FILE_MODE = 0o600
+REMOTE_STORAGE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    candidates = [path, *path.parents]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_symlink():
+            return True
+    return False
+
+
+def _remote_storage_retention_seconds() -> int:
+    raw_value = os.environ.get("REMOTE_STORAGE_RETENTION_SECONDS")
+    if not raw_value:
+        return REMOTE_STORAGE_RETENTION_SECONDS
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError("REMOTE_STORAGE_RETENTION_SECONDS must be an integer number of seconds") from exc
+    if value < 0:
+        raise RuntimeError("REMOTE_STORAGE_RETENTION_SECONDS must not be negative")
+    return value
+
+
+def _cleanup_remote_storage(root: Path) -> None:
+    cutoff = time.time() - _remote_storage_retention_seconds()
+    for candidate in root.glob("*.json"):
+        try:
+            stat_result = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(stat_result.st_mode) or not stat.S_ISREG(stat_result.st_mode):
+            continue
+        resolved = candidate.resolve()
+        if root != resolved.parent and root not in resolved.parents:
+            continue
+        if stat_result.st_mtime < cutoff:
+            candidate.unlink(missing_ok=True)
+
+
 def _remote_storage_root() -> Path:
     configured = os.environ.get("REMOTE_STORAGE_DIR")
     root = Path(configured) if configured else Path(tempfile.gettempdir()) / "zendesk-skill-remote"
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    if _path_has_symlink_component(root):
+        raise RuntimeError("REMOTE_STORAGE_DIR must not contain symlink components")
+    root.mkdir(mode=REMOTE_STORAGE_DIR_MODE, parents=True, exist_ok=True)
+    resolved = root.resolve()
+    if _path_has_symlink_component(resolved):
+        raise RuntimeError("REMOTE_STORAGE_DIR must not resolve through a symlink")
+    if not resolved.is_dir():
+        raise RuntimeError("REMOTE_STORAGE_DIR must be a directory")
+    stat_result = resolved.stat()
+    if hasattr(os, "geteuid") and stat_result.st_uid != os.geteuid():
+        raise RuntimeError("REMOTE_STORAGE_DIR must be owned by the running process user")
+    if stat.S_IMODE(stat_result.st_mode) != REMOTE_STORAGE_DIR_MODE:
+        os.chmod(resolved, REMOTE_STORAGE_DIR_MODE)
+        stat_result = resolved.stat()
+        if stat.S_IMODE(stat_result.st_mode) != REMOTE_STORAGE_DIR_MODE:
+            raise RuntimeError("REMOTE_STORAGE_DIR permissions must be 0700")
+    _cleanup_remote_storage(resolved)
+    return resolved
 
 
 def _remote_output_path(tool_name: str) -> str:
     root = _remote_storage_root()
-    candidate = (root / f"{tool_name}-{uuid.uuid4().hex}.json").resolve()
-    if root != candidate and root not in candidate.parents:
-        raise RuntimeError("Generated remote storage path escaped REMOTE_STORAGE_DIR")
-    if candidate.exists():
-        raise RuntimeError("Generated remote storage path already exists")
-    return str(candidate)
+    for _ in range(10):
+        candidate = (root / f"{tool_name}-{uuid.uuid4().hex}.json").resolve()
+        if root != candidate.parent and root not in candidate.parents:
+            raise RuntimeError("Generated remote storage path escaped REMOTE_STORAGE_DIR")
+        if not candidate.exists():
+            return str(candidate)
+    raise RuntimeError("Could not generate a unique remote storage file path")
 
 
 def _format_remote_result(result: dict) -> str:

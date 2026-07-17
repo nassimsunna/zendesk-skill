@@ -1327,8 +1327,8 @@ def slack_logout() -> dict:
 from zendesk_skill.reporting import send_slack_report, generate_markdown_report  # noqa: E402, F401
 
 
-# Text fields from Zendesk Talk are untrusted LLM-facing content. Keep raw
-# records in saved files, but wrap/redact direct MCP results.
+# Text fields from Zendesk Talk are untrusted LLM-facing content. Stored
+# responses and direct MCP results redact unnecessary sensitive fields.
 _TALK_SENSITIVE_FIELDS = {
     "from",
     "to",
@@ -1373,13 +1373,28 @@ _TALK_TEXT_FIELD_HINTS = (
 )
 
 
+def _minimize_talk_for_storage(value):
+    """Redact unnecessary sensitive Talk fields before writing response files."""
+    if isinstance(value, list):
+        return [_minimize_talk_for_storage(item) for item in value]
+    if isinstance(value, dict):
+        minimized = {}
+        for key, item in value.items():
+            if str(key).lower() in _TALK_SENSITIVE_FIELDS:
+                minimized[key] = "[redacted]" if item is not None else None
+            else:
+                minimized[key] = _minimize_talk_for_storage(item)
+        return minimized
+    return value
+
+
 def _sanitize_talk_for_llm(value, source_id: str = "talk"):
     """Wrap untrusted Talk text before returning it to the LLM.
 
-    Raw Zendesk Talk responses are still saved to disk by save_response. Direct
-    MCP returns keep IDs, timestamps, booleans, and metrics usable while wrapping
-    Zendesk-controlled text fields and redacting customer recordings/transcripts
-    or caller phone fields by default.
+    Stored Zendesk Talk responses and direct MCP returns redact unnecessary
+    sensitive fields. Direct MCP returns keep IDs, timestamps, booleans, and
+    metrics usable while wrapping Zendesk-controlled text fields and redacting
+    customer recordings/transcripts or caller phone fields by default.
     """
     if isinstance(value, list):
         return [_sanitize_talk_for_llm(item, source_id) for item in value]
@@ -1413,7 +1428,7 @@ async def get_talk_calls(start_date: str, end_date: str, output_path: str | None
     result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
     calls = result["calls"]
     metadata = result["metadata"]
-    payload = {"calls": calls, "metadata": metadata, "read_only": True}
+    payload = {"calls": _minimize_talk_for_storage(calls), "metadata": metadata, "read_only": True}
     file_path, _ = save_response("talk_calls", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
     return {"count": len(calls), "calls": _sanitize_talk_for_llm(calls), "metadata": metadata, "file_path": str(file_path), "read_only": True}
 
@@ -1426,7 +1441,7 @@ async def get_talk_legs(start_date: str, end_date: str, output_path: str | None 
     result = await fetch_incremental_with_metadata(client, LEGS_ENDPOINT, "legs", start_date, end_date)
     legs = result["legs"]
     metadata = result["metadata"]
-    payload = {"legs": legs, "metadata": metadata, "read_only": True}
+    payload = {"legs": _minimize_talk_for_storage(legs), "metadata": metadata, "read_only": True}
     file_path, _ = save_response("talk_legs", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
     return {"count": len(legs), "legs": _sanitize_talk_for_llm(legs), "metadata": metadata, "file_path": str(file_path), "read_only": True}
 
@@ -1459,11 +1474,11 @@ async def get_talk_analytics(
 
     leg_summaries = [summarize_leg(leg) for leg in legs]
     payload = {
-        "calls": calls,
-        "legs": legs,
-        "joined_calls": rows,
+        "calls": _minimize_talk_for_storage(calls),
+        "legs": _minimize_talk_for_storage(legs),
+        "joined_calls": _minimize_talk_for_storage(rows),
         "leg_summaries": leg_summaries,
-        "breakdowns": breakdowns,
+        "breakdowns": _minimize_talk_for_storage(breakdowns),
         "metadata": {"calls": calls_result["metadata"], "legs": legs_result["metadata"]},
         "read_only": True,
         "notes": [

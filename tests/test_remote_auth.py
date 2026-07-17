@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -420,3 +422,123 @@ def test_pyproject_requires_streamable_http_compatible_mcp_v1():
     lock_text = Path("uv.lock").read_text()
     assert 'specifier = ">=1.8.0,<2"' in lock_text
     assert 'specifier = ">=1.6.0"' not in lock_text
+
+
+def test_remote_storage_directory_permissions_are_owner_only(tmp_path, monkeypatch):
+    import stat
+    from zendesk_skill import server
+
+    root = tmp_path / "remote-storage"
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(root))
+
+    resolved = server._remote_storage_root()
+
+    assert resolved == root.resolve()
+    assert stat.S_IMODE(resolved.stat().st_mode) == 0o700
+
+
+def test_remote_storage_file_permissions_are_owner_only(tmp_path, monkeypatch):
+    import stat
+    from zendesk_skill import server
+    from zendesk_skill.storage import save_response
+
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(tmp_path))
+    path = server._remote_output_path("secure")
+
+    saved_path, _ = save_response("secure", {}, {"ok": True}, output_path=path)
+
+    assert saved_path == path
+    assert stat.S_IMODE(Path(path).stat().st_mode) == 0o600
+
+
+def test_remote_storage_tightens_existing_broad_permissions(tmp_path, monkeypatch):
+    import stat
+    from zendesk_skill import server
+
+    tmp_path.chmod(0o777)
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(tmp_path))
+
+    resolved = server._remote_storage_root()
+
+    assert stat.S_IMODE(resolved.stat().st_mode) == 0o700
+
+
+def test_remote_storage_rejects_symlink_escape(tmp_path, monkeypatch):
+    from zendesk_skill import server
+
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(link))
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        server._remote_storage_root()
+
+
+def test_remote_output_path_stays_inside_managed_directory(tmp_path, monkeypatch):
+    from zendesk_skill import server
+
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(tmp_path))
+
+    generated = Path(server._remote_output_path("safe")).resolve()
+
+    assert generated.parent == tmp_path.resolve()
+    assert generated.name.startswith("safe-")
+
+
+def test_remote_output_path_does_not_overwrite_existing_file(tmp_path, monkeypatch):
+    from zendesk_skill import server
+
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setattr(server.uuid, "uuid4", lambda: SimpleNamespace(hex="fixed"))
+    existing = tmp_path / "secure-fixed.json"
+    existing.write_text("already here")
+
+    with pytest.raises(RuntimeError, match="unique remote storage"):
+        server._remote_output_path("secure")
+
+    assert existing.read_text() == "already here"
+
+
+def test_remote_storage_cleanup_removes_only_expired_managed_files(tmp_path, monkeypatch):
+    import time
+    from zendesk_skill import server
+
+    managed = tmp_path / "managed"
+    outside = tmp_path / "outside"
+    managed.mkdir()
+    outside.mkdir()
+    old_managed = managed / "old.json"
+    new_managed = managed / "new.json"
+    old_outside = outside / "old.json"
+    for path in (old_managed, new_managed, old_outside):
+        path.write_text("{}")
+    old_time = time.time() - 10_000
+    os.utime(old_managed, (old_time, old_time))
+    os.utime(old_outside, (old_time, old_time))
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(managed))
+    monkeypatch.setenv("REMOTE_STORAGE_RETENTION_SECONDS", "60")
+
+    server._remote_storage_root()
+
+    assert not old_managed.exists()
+    assert new_managed.exists()
+    assert old_outside.exists()
+
+
+def test_talk_storage_minimization_redacts_recordings_and_transcripts():
+    from zendesk_skill import operations
+
+    minimized = operations._minimize_talk_for_storage({
+        "id": "call-1",
+        "recording_url": "https://recording.example/call-1",
+        "transcript": "private transcript",
+        "nested": {"voicemail_recording_url": "https://recording.example/vm"},
+        "talk_time": 30,
+    })
+
+    assert minimized["recording_url"] == "[redacted]"
+    assert minimized["transcript"] == "[redacted]"
+    assert minimized["nested"]["voicemail_recording_url"] == "[redacted]"
+    assert minimized["talk_time"] == 30
