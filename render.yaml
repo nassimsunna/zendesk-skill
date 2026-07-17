@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: zendesk-talk-mcp
+    env: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_TRANSPORT
+        value: http
+      - key: MCP_AUTH_MODE
+        value: oauth
+      - key: MCP_PUBLIC_BASE_URL
+        sync: false
+      - key: MCP_OAUTH_ISSUER
+        sync: false
+      - key: MCP_OAUTH_AUDIENCE
+        sync: false
+      - key: MCP_OAUTH_JWKS_URL
+        sync: false
+      - key: MCP_OAUTH_AUTHORIZATION_ENDPOINT
+        sync: false
+      - key: MCP_OAUTH_TOKEN_ENDPOINT
+        sync: false
+      - key: MCP_OAUTH_REQUIRED_SCOPE
+        value: zendesk:read
+      - key: MCP_ALLOWED_EMAIL
+        sync: false
+      - key: MCP_AUTH_TOKEN
+        sync: false
+      - key: ZENDESK_EMAIL
+        sync: false
+      - key: ZENDESK_TOKEN
+        sync: false
+      - key: ZENDESK_SUBDOMAIN
+        sync: false

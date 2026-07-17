@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -13,6 +14,51 @@ from zendesk_skill.utils.security import is_security_enabled
 
 # Default storage directory (cross-platform, per-user to avoid conflicts)
 DEFAULT_STORAGE_DIR = Path(tempfile.gettempdir()) / f"zd-cli-{os.getuid()}"
+
+
+def _remote_storage_root_if_applicable(file_path: Path) -> Path | None:
+    configured = os.environ.get("REMOTE_STORAGE_DIR")
+    root = Path(configured) if configured else Path(tempfile.gettempdir()) / "zendesk-skill-remote"
+    try:
+        resolved_root = root.resolve()
+        resolved_file = file_path.resolve()
+    except OSError:
+        return None
+    if resolved_file == resolved_root or resolved_root in resolved_file.parents:
+        return resolved_root
+    return None
+
+
+def _write_json_secure(file_path: Path, data: Any) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(file_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.chmod(file_path, 0o600)
+    except Exception:
+        try:
+            file_path.unlink(missing_ok=True)
+        finally:
+            raise
+
+
+def _write_json(file_path: Path, data: Any) -> None:
+    remote_root = _remote_storage_root_if_applicable(file_path)
+    if remote_root is not None:
+        resolved = file_path.resolve()
+        if resolved.parent != remote_root and remote_root not in resolved.parents:
+            raise RuntimeError("Remote response file escaped REMOTE_STORAGE_DIR")
+        if file_path.exists():
+            raise RuntimeError("Remote response file already exists")
+        _write_json_secure(file_path, data)
+        if stat.S_IMODE(file_path.stat().st_mode) != 0o600:
+            raise RuntimeError("Remote response file permissions must be 0600")
+        return
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
 
 
 def _get_storage_dir(ticket_id: str | None = None) -> Path:
@@ -299,8 +345,7 @@ def save_response(
         stored_data["metadata"]["security_detections"] = detections
 
     # Write to file
-    with open(file_path, "w") as f:
-        json.dump(stored_data, f, indent=2, default=str)
+    _write_json(file_path, stored_data)
 
     return str(file_path), stored_data
 
