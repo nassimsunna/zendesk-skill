@@ -3,7 +3,7 @@
 This module contains all Zendesk API interaction logic used by both
 the CLI and MCP server. All functions are async and return dicts.
 """
-
+import re
 import tempfile
 from pathlib import Path
 
