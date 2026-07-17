@@ -1431,9 +1431,11 @@ def _sanitize_talk_for_llm(value, source_id: str = "talk"):
             field_source = f"{record_id}:{key}"
             if _is_sensitive_talk_field(key_text, item):
                 sanitized[key] = "[redacted]" if item is not None else None
-            elif isinstance(item, str) and (
-                any(hint in key_text for hint in _TALK_TEXT_FIELD_HINTS)
-                or (key_text not in _TALK_SAFE_STRING_FIELDS and not key_text.endswith("_id"))
+elif (
+    isinstance(item, str)
+    and key_text not in _TALK_SAFE_STRING_FIELDS
+    and not key_text.endswith("_id")
+):
             ):
                 sanitized[key] = wrap_field_simple(item, "talk", field_source, *get_session_markers())
             else:
