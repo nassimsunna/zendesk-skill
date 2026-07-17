@@ -1,0 +1,48 @@
+name: Copy synchronized uv.lock
+
+on:
+  push:
+    branches:
+      - codex/add-read-only-zendesk-talk-analytics-support-kjz66e
+    paths:
+      - .github/workflows/copy-lock.yml
+
+permissions:
+  contents: write
+
+jobs:
+  copy-lock:
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'codex/add-read-only-zendesk-talk-analytics-support-kjz66e'
+    steps:
+      - name: Check out PR #2 branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/add-read-only-zendesk-talk-analytics-support-kjz66e
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch synchronized lockfile source branch
+        run: git fetch origin codex/add-read-only-zendesk-talk-analytics-support
+
+      - name: Copy synchronized uv.lock
+        run: git show origin/codex/add-read-only-zendesk-talk-analytics-support:uv.lock > uv.lock
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Verify copied lockfile is in sync
+        run: uv lock --check
+
+      - name: Commit only uv.lock
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already matches the synchronized source"
+            exit 0
+          fi
+          git add uv.lock
+          git diff --cached --name-only | grep -qx "uv.lock"
+          git commit -m "Copy synchronized uv.lock"
+          git push origin HEAD:codex/add-read-only-zendesk-talk-analytics-support-kjz66e
