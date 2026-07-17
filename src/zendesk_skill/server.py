@@ -26,7 +26,7 @@ from zendesk_skill.remote_auth import (
     metadata_response,
     remote_auth_response,
 )
-from zendesk_skill.utils.security import generate_markers, security_instructions, wrap_external_data, is_security_enabled
+from zendesk_skill.utils.security import generate_markers, security_instructions, wrap_external_data, is_security_enabled, wrap_field_simple
 
 
 MCP_MIN_STREAMABLE_HTTP_VERSION = "1.8.0"
@@ -870,8 +870,56 @@ def _remote_output_path(tool_name: str) -> str:
     raise RuntimeError("Could not generate a unique remote storage file path")
 
 
+REMOTE_PREVIEW_MAX_ITEMS = 25
+REMOTE_PREVIEW_MAX_DEPTH = 6
+
+
+def _sanitize_remote_preview(value, source_id: str = "remote", depth: int = 0):
+    """Return bounded, marker-wrapped data safe for remote read-only callers."""
+    if depth >= REMOTE_PREVIEW_MAX_DEPTH:
+        return "[preview truncated: maximum depth reached]"
+    if isinstance(value, list):
+        preview = [
+            _sanitize_remote_preview(item, f"{source_id}[{index}]", depth + 1)
+            for index, item in enumerate(value[:REMOTE_PREVIEW_MAX_ITEMS])
+        ]
+        if len(value) > REMOTE_PREVIEW_MAX_ITEMS:
+            preview.append({"preview_truncated": True, "remaining_items": len(value) - REMOTE_PREVIEW_MAX_ITEMS})
+        return preview
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in {"file_path", "filePath"}:
+                continue
+            sanitized[key] = _sanitize_remote_preview(item, f"{source_id}:{key_text}", depth + 1)
+        return sanitized
+    if isinstance(value, str):
+        return wrap_field_simple(value, "zendesk", source_id, _START, _END)
+    return value
+
+
 def _format_remote_result(result: dict) -> str:
-    return _format_result(result)
+    """Format remote results without exposing server-local paths.
+
+    Local operations often persist the complete response and return counts plus a
+    server-local file_path for CLI follow-up querying. Remote clients cannot read
+    that path, so include a bounded sanitized preview of the stored data while
+    omitting filesystem details.
+    """
+    remote_result = {key: value for key, value in result.items() if key != "file_path"}
+    file_path = result.get("file_path")
+    if file_path:
+        try:
+            stored = load_response(file_path)
+            data = stored.get("data", stored)
+            remote_result["preview"] = _sanitize_remote_preview(data)
+            remote_result["preview_item_cap"] = REMOTE_PREVIEW_MAX_ITEMS
+        except Exception as exc:
+            remote_result["preview_error"] = f"Could not load sanitized preview: {type(exc).__name__}"
+    else:
+        remote_result = _sanitize_remote_preview(remote_result)
+    return _format_result(remote_result)
 
 
 def _handle_remote_error(e: Exception) -> str:

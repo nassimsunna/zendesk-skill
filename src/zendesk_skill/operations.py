@@ -1382,7 +1382,7 @@ def _is_sensitive_talk_field(key: str, value) -> bool:
     key_text = str(key).lower()
     if key_text in _TALK_SENSITIVE_FIELDS:
         return True
-    return key_text == "phone_number" and _looks_like_phone_number(value)
+    return key_text in {"phone_number", "line"} and _looks_like_phone_number(value)
 
 
 _TALK_TEXT_FIELD_HINTS = (

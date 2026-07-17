@@ -607,3 +607,28 @@ def test_mismatched_oauth_issuer_remains_rejected(monkeypatch):
 
     assert valid is False
     assert "issuer" in reason.lower()
+
+
+def test_remote_result_includes_sanitized_preview_without_file_path(tmp_path, monkeypatch):
+    import json
+    from zendesk_skill import server
+    from zendesk_skill.storage import save_response
+
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(tmp_path))
+    output_path = server._remote_output_path("search")
+    saved_path, _ = save_response(
+        "search",
+        {"query": "status:open"},
+        {"tickets": [{"id": i, "subject": f"Ticket {i}"} for i in range(30)]},
+        output_path=output_path,
+    )
+
+    formatted = server._format_remote_result({"count": 30, "file_path": saved_path})
+    payload = json.loads(formatted)
+
+    assert "file_path" not in payload
+    assert "filePath" not in json.dumps(payload)
+    assert payload["count"] == 30
+    assert payload["preview_item_cap"] == server.REMOTE_PREVIEW_MAX_ITEMS
+    assert len(payload["preview"]["tickets"]) == server.REMOTE_PREVIEW_MAX_ITEMS + 1
+    assert payload["preview"]["tickets"][-1] == {"preview_truncated": True, "remaining_items": 5}
