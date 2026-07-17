@@ -1431,23 +1431,32 @@ def _sanitize_talk_for_llm(value, source_id: str = "talk"):
             field_source = f"{record_id}:{key}"
             if _is_sensitive_talk_field(key_text, item):
                 sanitized[key] = "[redacted]" if item is not None else None
-elif (
-    isinstance(item, str)
-    and key_text not in _TALK_SAFE_STRING_FIELDS
-    and not key_text.endswith("_id")
-):
+            elif (
+                isinstance(item, str)
+                and key_text not in _TALK_SAFE_STRING_FIELDS
+                and not key_text.endswith("_id")
             ):
-                sanitized[key] = wrap_field_simple(item, "talk", field_source, *get_session_markers())
+                sanitized[key] = wrap_field_simple(
+                    item,
+                    "talk",
+                    field_source,
+                    *get_session_markers(),
+                )
             else:
                 sanitized[key] = _sanitize_talk_for_llm(item, field_source)
         return sanitized
     return value
 
+
 # =============================================================================
 # Zendesk Talk Read-only Analytics Operations
 # =============================================================================
 
-async def get_talk_calls(start_date: str, end_date: str, output_path: str | None = None) -> dict:
+async def get_talk_calls(
+    start_date: str,
+    end_date: str,
+    output_path: str | None = None,
+) -> dict:
     """Retrieve read-only Zendesk Talk incremental call records."""
     from zendesk_skill.talk import CALLS_ENDPOINT, fetch_incremental_with_metadata
 
@@ -1456,8 +1465,19 @@ async def get_talk_calls(start_date: str, end_date: str, output_path: str | None
     calls = result["calls"]
     metadata = result["metadata"]
     payload = {"calls": _minimize_talk_for_storage(calls), "metadata": metadata, "read_only": True}
-    file_path, _ = save_response("talk_calls", {"start_date": start_date, "end_date": end_date}, payload, output_path=output_path)
-    return {"count": len(calls), "calls": _sanitize_talk_for_llm(calls), "metadata": metadata, "file_path": str(file_path), "read_only": True}
+    file_path, _ = save_response(
+        "talk_calls",
+        {"start_date": start_date, "end_date": end_date},
+        payload,
+        output_path=output_path,
+    )
+    return {
+        "count": len(calls),
+        "calls": _sanitize_talk_for_llm(calls),
+        "metadata": metadata,
+        "file_path": str(file_path),
+        "read_only": True,
+    }
 
 
 async def get_talk_legs(start_date: str, end_date: str, output_path: str | None = None) -> dict:
