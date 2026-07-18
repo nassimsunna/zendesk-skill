@@ -13,4 +13,4 @@ COPY src ./src
 RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
-CMD ["zendesk-mcp"]
+CMD ["python", "-m", "zendesk_skill.render_entrypoint"]
