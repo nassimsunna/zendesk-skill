@@ -19,7 +19,9 @@ RUN uv sync --frozen --no-dev
 # Zendesk content. Materialize both the ONNX model and tokenizer artifacts in a
 # stable image layer, then make Hugging Face strictly offline at runtime.
 RUN mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$FASTEMBED_CACHE_PATH" && \
-    python -c 'import os; from fastembed import TextEmbedding; model = TextEmbedding(model_name="Qdrant/bge-small-en-v1.5-onnx-Q", cache_dir=os.environ["FASTEMBED_CACHE_PATH"]); next(model.embed(["build-time cache verification"]))'
+    python -c 'import os; from fastembed import TextEmbedding; model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", cache_dir=os.environ["FASTEMBED_CACHE_PATH"]); next(model.embed(["build-time cache verification"]))'
+# Prove that the cached model is complete without allowing a network fallback.
+RUN --network=none HF_HUB_OFFLINE=1 python -c 'import os; from fastembed import TextEmbedding; model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", cache_dir=os.environ["FASTEMBED_CACHE_PATH"], local_files_only=True); next(model.embed(["offline cache verification"]))'
 ENV HF_HUB_OFFLINE=1
 # Fail the image build unless the production application can initialize while
 # Hugging Face is offline and the preloaded artifacts are complete.
