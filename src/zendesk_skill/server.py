@@ -922,13 +922,31 @@ def _format_remote_result(result: dict) -> str:
     return _format_result(remote_result)
 
 
-def _format_trusted_remote_result(result: dict) -> str:
-    """Format server-generated operational data without content screening.
+_AUTH_STATUS_TRUSTED_FIELDS = frozenset(
+    {
+        "configured",
+        "source",
+        "config_path",
+        "env_vars_set",
+        "has_config_file",
+    }
+)
 
-    This is intentionally limited to trusted responses such as authentication
-    status. Zendesk API payloads must continue through ``_format_remote_result``.
-    """
-    return _format_result({key: value for key, value in result.items() if key != "file_path"})
+
+def _format_trusted_remote_result(result: dict) -> str:
+    """Format auth status while screening all non-allowlisted values."""
+    formatted_result = {}
+    for key, value in result.items():
+        if key == "file_path":
+            continue
+        if key in _AUTH_STATUS_TRUSTED_FIELDS:
+            formatted_result[key] = value
+        else:
+            formatted_result[key] = _sanitize_remote_preview(
+                value,
+                f"remote:auth_status:{key}",
+            )
+    return _format_result(formatted_result)
 
 
 def _handle_remote_error(e: Exception) -> str:

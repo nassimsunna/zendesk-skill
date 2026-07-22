@@ -635,7 +635,8 @@ def test_remote_result_includes_sanitized_preview_without_file_path(tmp_path, mo
 
 
 def test_trusted_auth_status_does_not_initialize_content_security(monkeypatch):
-    """Operational status must not run the heavyweight untrusted-data wrapper."""
+    """Trusted status-only fields must not run the heavyweight wrapper."""
+    import json
     from zendesk_skill import server
 
     def unexpected_security_model(*args, **kwargs):
@@ -643,14 +644,76 @@ def test_trusted_auth_status_does_not_initialize_content_security(monkeypatch):
 
     monkeypatch.setattr(server, "wrap_field_simple", unexpected_security_model)
     formatted = server._format_trusted_remote_result(
-        {"authenticated": True, "auth_mode": "oauth", "file_path": "/private/status.json"}
+        {
+            "configured": True,
+            "source": "env",
+            "config_path": "/root/.config/zd-cli/config.json",
+            "env_vars_set": ["ZENDESK_EMAIL", "ZENDESK_TOKEN", "ZENDESK_SUBDOMAIN"],
+            "has_config_file": False,
+            "user": None,
+            "error": None,
+            "guidance": None,
+            "file_path": "/private/status.json",
+        }
     )
 
-    assert json.loads(formatted) == {"authenticated": True, "auth_mode": "oauth"}
+    assert json.loads(formatted) == {
+        "configured": True,
+        "source": "env",
+        "config_path": "/root/.config/zd-cli/config.json",
+        "env_vars_set": ["ZENDESK_EMAIL", "ZENDESK_TOKEN", "ZENDESK_SUBDOMAIN"],
+        "has_config_file": False,
+        "user": None,
+        "error": None,
+        "guidance": None,
+    }
+
+
+def test_auth_status_sanitizes_zendesk_user_and_unknown_fields(monkeypatch):
+    """Zendesk-derived and unknown auth fields remain security wrapped."""
+    import json
+    from zendesk_skill import server
+
+    calls = []
+
+    def record_wrapper(value, source_type, source_id, start, end):
+        calls.append((value, source_type, source_id))
+        return {"secured": value}
+
+    monkeypatch.setattr(server, "wrap_field_simple", record_wrapper)
+    payload = json.loads(
+        server._format_trusted_remote_result(
+            {
+                "configured": True,
+                "source": "env",
+                "user": {
+                    "id": 123,
+                    "name": "Zendesk Admin",
+                    "email": "admin@example.com",
+                    "role": "admin",
+                    "future_profile_field": "untrusted profile text",
+                },
+                "error": "Zendesk API error text",
+                "future_status": "future untrusted text",
+            }
+        )
+    )
+
+    assert payload["configured"] is True
+    assert payload["source"] == "env"
+    assert payload["user"]["id"] == 123
+    assert payload["user"]["name"] == {"secured": "Zendesk Admin"}
+    assert payload["user"]["email"] == {"secured": "admin@example.com"}
+    assert payload["user"]["role"] == {"secured": "admin"}
+    assert payload["user"]["future_profile_field"] == {"secured": "untrusted profile text"}
+    assert payload["error"] == {"secured": "Zendesk API error text"}
+    assert payload["future_status"] == {"secured": "future untrusted text"}
+    assert calls
 
 
 def test_untrusted_remote_content_still_uses_security_wrapper(monkeypatch):
     """Zendesk strings, including Talk fields, remain security wrapped."""
+    import json
     from zendesk_skill import server
 
     calls = []
