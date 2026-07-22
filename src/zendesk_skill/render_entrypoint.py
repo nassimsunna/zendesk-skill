@@ -48,8 +48,19 @@ def public_netloc_from_base_url(value: str | None) -> str | None:
 
 def configure_transport_security() -> None:
     """Configure production-safe transport settings before creating the HTTP app."""
-    from mcp.server.transport_security import TransportSecuritySettings
     from zendesk_skill import server
+
+    # Render instances can restart or sleep, so remote requests must not depend
+    # on an in-memory MCP session surviving between calls.
+    server.remote_mcp.settings.stateless_http = True
+    server.remote_mcp.settings.json_response = True
+
+    # DNS-rebinding settings were added after the earliest supported MCP SDK.
+    # Apply them when available while preserving compatibility with v1.8.x.
+    try:
+        from mcp.server.transport_security import TransportSecuritySettings
+    except ImportError:
+        return
 
     allowed_hosts = list(LOCAL_ALLOWED_HOSTS)
     public_netloc = public_netloc_from_base_url(os.environ.get("MCP_PUBLIC_BASE_URL"))
@@ -61,10 +72,6 @@ def configure_transport_security() -> None:
         allowed_hosts=allowed_hosts,
         allowed_origins=[*LOCAL_ALLOWED_ORIGINS, *CLAUDE_ALLOWED_ORIGINS],
     )
-    # Render instances can restart or sleep, so remote requests must not depend
-    # on an in-memory MCP session surviving between calls.
-    server.remote_mcp.settings.stateless_http = True
-    server.remote_mcp.settings.json_response = True
 
 
 class RemoteAuthASGIMiddleware:
