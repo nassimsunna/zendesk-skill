@@ -731,3 +731,22 @@ def test_updated_call_outside_reporting_period_not_counted_inside_with_joined_ol
 
     assert rows[0]["classification"]["answered_by_agent"] is True
     assert grouped == [{"key": "2025-12-31", "count": 1, "outcomes": {"answered_by_agent": 1}}]
+
+
+def test_talk_line_redacts_only_phone_numbers():
+    from zendesk_skill.operations import _minimize_talk_for_storage, _sanitize_talk_for_llm
+
+    payload = [
+        {"id": "call-1", "line": "+1 (415) 555-1212", "phone_number": "+1 650 555 1212"},
+        {"id": "call-2", "line": "Premier Support Line", "phone_number": "main-support"},
+    ]
+
+    minimized = _minimize_talk_for_storage(payload)
+    sanitized = _sanitize_talk_for_llm(payload)
+
+    assert minimized[0]["line"] == "[redacted]"
+    assert minimized[0]["phone_number"] == "[redacted]"
+    assert minimized[1]["line"] == "Premier Support Line"
+    assert minimized[1]["phone_number"] == "main-support"
+    assert sanitized[0]["line"] == "[redacted]"
+    assert sanitized[0]["phone_number"] == "[redacted]"
