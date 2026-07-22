@@ -5,6 +5,39 @@ from types import SimpleNamespace
 import pytest
 
 
+async def call_asgi_app(app, path="/mcp", headers=()):
+    """Call a raw ASGI app and return the messages it sends."""
+    messages = []
+    request_sent = False
+
+    async def receive():
+        nonlocal request_sent
+        if request_sent:
+            return {"type": "http.disconnect"}
+        request_sent = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST" if path == "/mcp" else "GET",
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": list(headers),
+        "server": ("mcp.example.com", 443),
+        "client": ("127.0.0.1", 1234),
+        "root_path": "",
+    }
+    await app(scope, receive, send)
+    return messages
+
+
 def request(path="/mcp", base_url="https://mcp.example.com/"):
     return SimpleNamespace(url=SimpleNamespace(path=path), base_url=base_url)
 
@@ -176,6 +209,78 @@ def test_streamable_http_app_routes_and_tools_registered(monkeypatch):
     assert "zendesk_talk_get_calls" in tool_names
     assert "zendesk_talk_get_legs" in tool_names
     assert "zendesk_talk_analytics" in tool_names
+
+
+def test_remote_auth_middleware_is_raw_asgi():
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from zendesk_skill import server
+
+    assert not issubclass(server._RemoteAuthMiddleware, BaseHTTPMiddleware)
+
+
+@pytest.mark.asyncio
+async def test_authorized_mcp_request_reaches_downstream(monkeypatch):
+    from zendesk_skill import server
+
+    received_scopes = []
+
+    async def downstream(scope, receive, send):
+        received_scopes.append(scope)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    monkeypatch.setattr(server, "remote_auth_response", lambda request, authorization: None)
+    messages = await call_asgi_app(
+        server._RemoteAuthMiddleware(downstream),
+        headers=[(b"authorization", b"Bearer valid")],
+    )
+
+    assert received_scopes[0]["path"] == "/mcp"
+    assert messages[0]["status"] == 204
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_mcp_request_returns_401(monkeypatch):
+    from zendesk_skill import server
+
+    oauth_env(monkeypatch)
+
+    async def downstream(scope, receive, send):
+        raise AssertionError("unauthorized request reached downstream app")
+
+    messages = await call_asgi_app(server._RemoteAuthMiddleware(downstream))
+
+    assert messages[0]["status"] == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/health",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server",
+    ],
+)
+async def test_public_remote_routes_remain_accessible(path, monkeypatch):
+    from zendesk_skill import server
+
+    oauth_env(monkeypatch)
+
+    async def downstream(scope, receive, send):
+        raise AssertionError("public route should be handled by auth middleware")
+
+    messages = await call_asgi_app(server._RemoteAuthMiddleware(downstream), path=path)
+
+    assert messages[0]["status"] == 200
+
+
+def test_remote_mcp_uses_stateless_json_http():
+    from zendesk_skill import server
+
+    assert server.remote_mcp.settings.stateless_http is True
+    assert server.remote_mcp.settings.json_response is True
 
 
 def test_repeated_authentication_reuses_jwks_client(monkeypatch):
@@ -607,3 +712,28 @@ def test_mismatched_oauth_issuer_remains_rejected(monkeypatch):
 
     assert valid is False
     assert "issuer" in reason.lower()
+
+
+def test_remote_result_includes_sanitized_preview_without_file_path(tmp_path, monkeypatch):
+    import json
+    from zendesk_skill import server
+    from zendesk_skill.storage import save_response
+
+    monkeypatch.setenv("REMOTE_STORAGE_DIR", str(tmp_path))
+    output_path = server._remote_output_path("search")
+    saved_path, _ = save_response(
+        "search",
+        {"query": "status:open"},
+        {"tickets": [{"id": i, "subject": f"Ticket {i}"} for i in range(30)]},
+        output_path=output_path,
+    )
+
+    formatted = server._format_remote_result({"count": 30, "file_path": saved_path})
+    payload = json.loads(formatted)
+
+    assert "file_path" not in payload
+    assert "filePath" not in json.dumps(payload)
+    assert payload["count"] == 30
+    assert payload["preview_item_cap"] == server.REMOTE_PREVIEW_MAX_ITEMS
+    assert len(payload["preview"]["tickets"]) == server.REMOTE_PREVIEW_MAX_ITEMS + 1
+    assert payload["preview"]["tickets"][-1] == {"preview_truncated": True, "remaining_items": 5}
