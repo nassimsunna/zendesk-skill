@@ -632,3 +632,39 @@ def test_remote_result_includes_sanitized_preview_without_file_path(tmp_path, mo
     assert payload["preview_item_cap"] == server.REMOTE_PREVIEW_MAX_ITEMS
     assert len(payload["preview"]["tickets"]) == server.REMOTE_PREVIEW_MAX_ITEMS + 1
     assert payload["preview"]["tickets"][-1] == {"preview_truncated": True, "remaining_items": 5}
+
+
+def test_trusted_auth_status_does_not_initialize_content_security(monkeypatch):
+    """Operational status must not run the heavyweight untrusted-data wrapper."""
+    from zendesk_skill import server
+
+    def unexpected_security_model(*args, **kwargs):
+        raise AssertionError("trusted auth status initialized content security")
+
+    monkeypatch.setattr(server, "wrap_field_simple", unexpected_security_model)
+    formatted = server._format_trusted_remote_result(
+        {"authenticated": True, "auth_mode": "oauth", "file_path": "/private/status.json"}
+    )
+
+    assert json.loads(formatted) == {"authenticated": True, "auth_mode": "oauth"}
+
+
+def test_untrusted_remote_content_still_uses_security_wrapper(monkeypatch):
+    """Zendesk strings, including Talk fields, remain security wrapped."""
+    from zendesk_skill import server
+
+    calls = []
+
+    def record_wrapper(value, source_type, source_id, start, end):
+        calls.append((value, source_type, source_id))
+        return {"secured": value}
+
+    monkeypatch.setattr(server, "wrap_field_simple", record_wrapper)
+    payload = json.loads(
+        server._format_remote_result(
+            {"talk_calls": [{"customer_text": "user supplied transcript"}]}
+        )
+    )
+
+    assert payload["talk_calls"][0]["customer_text"] == {"secured": "user supplied transcript"}
+    assert calls == [("user supplied transcript", "zendesk", "remote:talk_calls[0]:customer_text")]

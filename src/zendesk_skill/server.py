@@ -922,6 +922,15 @@ def _format_remote_result(result: dict) -> str:
     return _format_result(remote_result)
 
 
+def _format_trusted_remote_result(result: dict) -> str:
+    """Format server-generated operational data without content screening.
+
+    This is intentionally limited to trusted responses such as authentication
+    status. Zendesk API payloads must continue through ``_format_remote_result``.
+    """
+    return _format_result({key: value for key, value in result.items() if key != "file_path"})
+
+
 def _handle_remote_error(e: Exception) -> str:
     return _handle_error(e)
 
@@ -1090,7 +1099,7 @@ def create_remote_read_only_mcp() -> FastMCP:
     @remote.tool(name="zendesk_auth_status")
     async def remote_zendesk_auth_status(params: RemoteAuthStatusInput) -> str:
         try:
-            return _format_remote_result(await operations.check_auth_status(validate=params.validate_credentials))
+            return _format_trusted_remote_result(await operations.check_auth_status(validate=params.validate_credentials))
         except Exception as e:
             return _handle_remote_error(e)
 
