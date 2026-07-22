@@ -922,6 +922,33 @@ def _format_remote_result(result: dict) -> str:
     return _format_result(remote_result)
 
 
+_AUTH_STATUS_TRUSTED_FIELDS = frozenset(
+    {
+        "configured",
+        "source",
+        "config_path",
+        "env_vars_set",
+        "has_config_file",
+    }
+)
+
+
+def _format_trusted_remote_result(result: dict) -> str:
+    """Format auth status while screening all non-allowlisted values."""
+    formatted_result = {}
+    for key, value in result.items():
+        if key == "file_path":
+            continue
+        if key in _AUTH_STATUS_TRUSTED_FIELDS:
+            formatted_result[key] = value
+        else:
+            formatted_result[key] = _sanitize_remote_preview(
+                value,
+                f"remote:auth_status:{key}",
+            )
+    return _format_result(formatted_result)
+
+
 def _handle_remote_error(e: Exception) -> str:
     return _handle_error(e)
 
@@ -1090,7 +1117,7 @@ def create_remote_read_only_mcp() -> FastMCP:
     @remote.tool(name="zendesk_auth_status")
     async def remote_zendesk_auth_status(params: RemoteAuthStatusInput) -> str:
         try:
-            return _format_remote_result(await operations.check_auth_status(validate=params.validate_credentials))
+            return _format_trusted_remote_result(await operations.check_auth_status(validate=params.validate_credentials))
         except Exception as e:
             return _handle_remote_error(e)
 
