@@ -1,9 +1,13 @@
 """Zendesk MCP Server - Thin wrapper around operations module."""
 
+import asyncio
 import json
+import logging
 import os
 import stat
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from importlib.metadata import PackageNotFoundError, version as package_version
 import tempfile
 import uuid
@@ -30,6 +34,16 @@ from zendesk_skill.utils.security import generate_markers, security_instructions
 
 
 MCP_MIN_STREAMABLE_HTTP_VERSION = "1.8.0"
+
+logger = logging.getLogger(__name__)
+
+# Security screening may lazily initialize the ONNX model.  A single shared
+# worker keeps that CPU-heavy work off the ASGI event loop and prevents
+# concurrent requests from initializing multiple model instances.
+_SECURITY_FORMATTING_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="zendesk-security",
+)
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -949,6 +963,35 @@ def _format_trusted_remote_result(result: dict) -> str:
     return _format_result(formatted_result)
 
 
+async def _run_security_formatter(formatter, result: dict) -> str:
+    """Run a synchronous security formatter on the bounded shared worker."""
+    formatter_name = formatter.__name__
+    started = time.monotonic()
+    logger.info("Security formatting started formatter=%s", formatter_name)
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _SECURITY_FORMATTING_EXECUTOR,
+            partial(formatter, result),
+        )
+    finally:
+        logger.info(
+            "Security formatting completed formatter=%s elapsed_seconds=%.3f",
+            formatter_name,
+            time.monotonic() - started,
+        )
+
+
+async def _format_remote_result_async(result: dict) -> str:
+    """Format untrusted remote data without blocking the ASGI event loop."""
+    return await _run_security_formatter(_format_remote_result, result)
+
+
+async def _format_trusted_remote_result_async(result: dict) -> str:
+    """Format allowlisted auth metadata and screen its untrusted subtrees."""
+    return await _run_security_formatter(_format_trusted_remote_result, result)
+
+
 def _handle_remote_error(e: Exception) -> str:
     return _handle_error(e)
 
@@ -960,7 +1003,7 @@ def create_remote_read_only_mcp() -> FastMCP:
     @remote.tool(name="zendesk_get_ticket")
     async def remote_zendesk_get_ticket(params: RemoteTicketIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_ticket(params.ticket_id, _remote_output_path("ticket")))
+            return await _format_remote_result_async(await operations.get_ticket(params.ticket_id, _remote_output_path("ticket")))
         except Exception as e:
             return _handle_remote_error(e)
 
@@ -968,35 +1011,35 @@ def create_remote_read_only_mcp() -> FastMCP:
     async def remote_zendesk_search(params: RemoteSearchInput) -> str:
         try:
             result = await operations.search_tickets(params.query, params.page, params.per_page, params.sort_by, params.sort_order, _remote_output_path("search"))
-            return _format_remote_result(result)
+            return await _format_remote_result_async(result)
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_ticket_details")
     async def remote_zendesk_get_ticket_details(params: RemoteTicketIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_ticket_details(params.ticket_id, _remote_output_path("ticket_details")))
+            return await _format_remote_result_async(await operations.get_ticket_details(params.ticket_id, _remote_output_path("ticket_details")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_linked_incidents")
     async def remote_zendesk_get_linked_incidents(params: RemoteTicketIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_linked_incidents(params.ticket_id, _remote_output_path("linked_incidents")))
+            return await _format_remote_result_async(await operations.get_linked_incidents(params.ticket_id, _remote_output_path("linked_incidents")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_ticket_metrics")
     async def remote_zendesk_get_ticket_metrics(params: RemoteTicketIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_ticket_metrics(params.ticket_id, _remote_output_path("ticket_metrics")))
+            return await _format_remote_result_async(await operations.get_ticket_metrics(params.ticket_id, _remote_output_path("ticket_metrics")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_list_ticket_metrics")
     async def remote_zendesk_list_ticket_metrics(params: RemotePaginatedInput) -> str:
         try:
-            return _format_remote_result(await operations.list_ticket_metrics(params.page, params.per_page, _remote_output_path("list_metrics")))
+            return await _format_remote_result_async(await operations.list_ticket_metrics(params.page, params.per_page, _remote_output_path("list_metrics")))
         except Exception as e:
             return _handle_remote_error(e)
 
@@ -1004,77 +1047,77 @@ def create_remote_read_only_mcp() -> FastMCP:
     async def remote_zendesk_get_satisfaction_ratings(params: RemoteSatisfactionRatingsInput) -> str:
         try:
             result = await operations.get_satisfaction_ratings(params.score, params.start_time, params.end_time, params.page, params.per_page, _remote_output_path("satisfaction_ratings"))
-            return _format_remote_result(result)
+            return await _format_remote_result_async(result)
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_satisfaction_rating")
     async def remote_zendesk_get_satisfaction_rating(params: RemoteRatingIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_satisfaction_rating(params.rating_id, _remote_output_path("satisfaction_rating")))
+            return await _format_remote_result_async(await operations.get_satisfaction_rating(params.rating_id, _remote_output_path("satisfaction_rating")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_list_views")
     async def remote_zendesk_list_views(params: RemoteOutputOnlyInput) -> str:
         try:
-            return _format_remote_result(await operations.list_views(output_path=_remote_output_path("views")))
+            return await _format_remote_result_async(await operations.list_views(output_path=_remote_output_path("views")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_view_count")
     async def remote_zendesk_get_view_count(params: RemoteViewIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_view_count(params.view_id, _remote_output_path("view_count")))
+            return await _format_remote_result_async(await operations.get_view_count(params.view_id, _remote_output_path("view_count")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_view_tickets")
     async def remote_zendesk_get_view_tickets(params: RemoteViewTicketsInput) -> str:
         try:
-            return _format_remote_result(await operations.get_view_tickets(params.view_id, params.page, params.per_page, _remote_output_path("view_tickets")))
+            return await _format_remote_result_async(await operations.get_view_tickets(params.view_id, params.page, params.per_page, _remote_output_path("view_tickets")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_user")
     async def remote_zendesk_get_user(params: RemoteUserIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_user(params.user_id, _remote_output_path("user")))
+            return await _format_remote_result_async(await operations.get_user(params.user_id, _remote_output_path("user")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_search_users")
     async def remote_zendesk_search_users(params: RemoteSearchQueryInput) -> str:
         try:
-            return _format_remote_result(await operations.search_users(params.query, _remote_output_path("search_users")))
+            return await _format_remote_result_async(await operations.search_users(params.query, _remote_output_path("search_users")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_organization")
     async def remote_zendesk_get_organization(params: RemoteOrgIdInput) -> str:
         try:
-            return _format_remote_result(await operations.get_organization(params.organization_id, _remote_output_path("organization")))
+            return await _format_remote_result_async(await operations.get_organization(params.organization_id, _remote_output_path("organization")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_search_organizations")
     async def remote_zendesk_search_organizations(params: RemoteSearchQueryInput) -> str:
         try:
-            return _format_remote_result(await operations.search_organizations(params.query, _remote_output_path("search_organizations")))
+            return await _format_remote_result_async(await operations.search_organizations(params.query, _remote_output_path("search_organizations")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_talk_get_calls")
     async def remote_zendesk_talk_get_calls(params: RemoteTalkAnalyticsInput) -> str:
         try:
-            return _format_remote_result(await operations.get_talk_calls(params.start_date, params.end_date, _remote_output_path("talk_calls")))
+            return await _format_remote_result_async(await operations.get_talk_calls(params.start_date, params.end_date, _remote_output_path("talk_calls")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_talk_get_legs")
     async def remote_zendesk_talk_get_legs(params: RemoteTalkAnalyticsInput) -> str:
         try:
-            return _format_remote_result(await operations.get_talk_legs(params.start_date, params.end_date, _remote_output_path("talk_legs")))
+            return await _format_remote_result_async(await operations.get_talk_legs(params.start_date, params.end_date, _remote_output_path("talk_legs")))
         except Exception as e:
             return _handle_remote_error(e)
 
@@ -1082,42 +1125,42 @@ def create_remote_read_only_mcp() -> FastMCP:
     async def remote_zendesk_talk_analytics(params: RemoteTalkAnalyticsInput) -> str:
         try:
             result = await operations.get_talk_analytics(params.start_date, params.end_date, params.breakdown_by, _remote_output_path("talk_analytics"))
-            return _format_remote_result(result)
+            return await _format_remote_result_async(result)
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_list_groups")
     async def remote_zendesk_list_groups(params: RemoteOutputOnlyInput) -> str:
         try:
-            return _format_remote_result(await operations.list_groups(_remote_output_path("groups")))
+            return await _format_remote_result_async(await operations.list_groups(_remote_output_path("groups")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_list_tags")
     async def remote_zendesk_list_tags(params: RemoteOutputOnlyInput) -> str:
         try:
-            return _format_remote_result(await operations.list_tags(_remote_output_path("tags")))
+            return await _format_remote_result_async(await operations.list_tags(_remote_output_path("tags")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_list_sla_policies")
     async def remote_zendesk_list_sla_policies(params: RemoteOutputOnlyInput) -> str:
         try:
-            return _format_remote_result(await operations.list_sla_policies(_remote_output_path("sla_policies")))
+            return await _format_remote_result_async(await operations.list_sla_policies(_remote_output_path("sla_policies")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_get_current_user")
     async def remote_zendesk_get_current_user(params: RemoteOutputOnlyInput) -> str:
         try:
-            return _format_remote_result(await operations.get_current_user(_remote_output_path("current_user")))
+            return await _format_remote_result_async(await operations.get_current_user(_remote_output_path("current_user")))
         except Exception as e:
             return _handle_remote_error(e)
 
     @remote.tool(name="zendesk_auth_status")
     async def remote_zendesk_auth_status(params: RemoteAuthStatusInput) -> str:
         try:
-            return _format_trusted_remote_result(await operations.check_auth_status(validate=params.validate_credentials))
+            return await _format_trusted_remote_result_async(await operations.check_auth_status(validate=params.validate_credentials))
         except Exception as e:
             return _handle_remote_error(e)
 
