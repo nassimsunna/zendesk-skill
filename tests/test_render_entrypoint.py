@@ -1,3 +1,6 @@
+import asyncio
+import threading
+
 import pytest
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -119,6 +122,39 @@ async def test_health_is_public():
 
     messages = await _invoke(RemoteAuthASGIMiddleware(downstream), _scope(path="/health"))
     assert messages[0]["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_health_stays_responsive_during_slow_security_formatting(monkeypatch):
+    """A lazy/slow security model must never monopolize the ASGI event loop."""
+    from zendesk_skill import server
+
+    screening_started = threading.Event()
+    release_screening = threading.Event()
+
+    def slow_wrapper(value, source_type, source_id, start, end):
+        screening_started.set()
+        assert release_screening.wait(timeout=2)
+        return {"secured": value}
+
+    monkeypatch.setattr(server, "wrap_field_simple", slow_wrapper)
+    formatting = asyncio.create_task(
+        server._format_remote_result_async({"tickets": [{"subject": "untrusted"}]})
+    )
+    await asyncio.wait_for(asyncio.to_thread(screening_started.wait), timeout=1)
+
+    async def downstream(scope, receive, send):
+        raise AssertionError("health must be handled before FastMCP")
+
+    try:
+        messages = await asyncio.wait_for(
+            _invoke(RemoteAuthASGIMiddleware(downstream), _scope(path="/health")),
+            timeout=0.25,
+        )
+        assert messages[0]["status"] == 200
+    finally:
+        release_screening.set()
+        await formatting
 
 
 def _oauth_env(monkeypatch):

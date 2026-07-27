@@ -1,4 +1,7 @@
+import asyncio
 import os
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -731,3 +734,85 @@ def test_untrusted_remote_content_still_uses_security_wrapper(monkeypatch):
 
     assert payload["talk_calls"][0]["customer_text"] == {"secured": "user supplied transcript"}
     assert calls == [("user supplied transcript", "zendesk", "remote:talk_calls[0]:customer_text")]
+
+
+@pytest.mark.asyncio
+async def test_async_auth_formatter_screens_zendesk_user_subtree(monkeypatch):
+    """Validated identity data is still screened after moving work off-loop."""
+    import json
+    from zendesk_skill import server
+
+    calls = []
+
+    def record_wrapper(value, source_type, source_id, start, end):
+        calls.append((value, source_type, source_id))
+        return {"secured": value}
+
+    monkeypatch.setattr(server, "wrap_field_simple", record_wrapper)
+    formatted = await server._format_trusted_remote_result_async(
+        {"configured": True, "user": {"name": "Zendesk Admin", "email": "admin@example.com"}}
+    )
+
+    payload = json.loads(formatted)
+    assert payload["configured"] is True
+    assert payload["user"]["name"] == {"secured": "Zendesk Admin"}
+    assert payload["user"]["email"] == {"secured": "admin@example.com"}
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_security_formatting_worker_is_bounded(monkeypatch):
+    """Concurrent requests serialize model use through the single shared worker."""
+    from zendesk_skill import server
+
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+    initialization_count = 0
+    initialized = False
+
+    def slow_wrapper(value, source_type, source_id, start, end):
+        nonlocal active, maximum_active, initialization_count, initialized
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if not initialized:
+                initialized = True
+                initialization_count += 1
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return value
+
+    monkeypatch.setattr(server, "wrap_field_simple", slow_wrapper)
+    await asyncio.gather(
+        *(server._format_remote_result_async({"content": f"ticket {index}"}) for index in range(4))
+    )
+
+    assert maximum_active == 1
+    assert initialization_count == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_status_without_validation_has_no_security_model_cost(monkeypatch):
+    """Status-only results stay fast and do not initialize the security model."""
+    from zendesk_skill import server
+
+    def unexpected_wrapper(*args, **kwargs):
+        raise AssertionError("status-only response initialized content security")
+
+    monkeypatch.setattr(server, "wrap_field_simple", unexpected_wrapper)
+    started = time.monotonic()
+    await server._format_trusted_remote_result_async(
+        {
+            "configured": True,
+            "source": "env",
+            "config_path": "/root/.config/zd-cli/config.json",
+            "env_vars_set": ["ZENDESK_EMAIL", "ZENDESK_TOKEN", "ZENDESK_SUBDOMAIN"],
+            "has_config_file": False,
+            "user": None,
+            "error": None,
+            "guidance": None,
+        }
+    )
+    assert time.monotonic() - started < 0.5
