@@ -157,6 +157,49 @@ async def test_health_stays_responsive_during_slow_security_formatting(monkeypat
         await formatting
 
 
+@pytest.mark.asyncio
+async def test_health_stays_responsive_during_slow_talk_operations_sanitizer(monkeypatch, tmp_path):
+    """Talk's operations-level screening must run outside the ASGI loop."""
+    from zendesk_skill import operations
+    from zendesk_skill import talk
+
+    screening_started = threading.Event()
+    release_screening = threading.Event()
+
+    async def fake_calls(*args, **kwargs):
+        return {"calls": [{"id": "call-1", "group_name": "untrusted"}], "metadata": {}}
+
+    async def fake_legs(*args, **kwargs):
+        return {"legs": [], "metadata": {}}
+
+    def slow_wrapper(value, *args):
+        screening_started.set()
+        assert release_screening.wait(timeout=2)
+        return {"secured": value}
+
+    monkeypatch.setattr(operations, "_get_client", lambda: object())
+    monkeypatch.setattr(talk, "fetch_incremental_with_metadata", fake_calls)
+    monkeypatch.setattr(talk, "fetch_relevant_legs_for_calls", fake_legs)
+    monkeypatch.setattr(operations, "wrap_field_simple", slow_wrapper)
+    analytics = asyncio.create_task(operations.get_talk_analytics(
+        "2026-01-01", "2026-01-02", output_path=str(tmp_path / "talk.json")
+    ))
+    await asyncio.wait_for(asyncio.to_thread(screening_started.wait), timeout=1)
+
+    async def downstream(scope, receive, send):
+        raise AssertionError("health must be handled before FastMCP")
+
+    try:
+        messages = await asyncio.wait_for(
+            _invoke(RemoteAuthASGIMiddleware(downstream), _scope(path="/health")),
+            timeout=0.25,
+        )
+        assert messages[0]["status"] == 200
+    finally:
+        release_screening.set()
+        await analytics
+
+
 def _oauth_env(monkeypatch):
     monkeypatch.setenv("MCP_AUTH_MODE", "oauth")
     monkeypatch.setenv("MCP_PUBLIC_BASE_URL", "https://zendesk-talk-mcp.onrender.com")

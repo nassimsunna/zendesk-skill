@@ -6,7 +6,6 @@ import logging
 import os
 import stat
 import time
-from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version as package_version
 import tempfile
@@ -30,7 +29,7 @@ from zendesk_skill.remote_auth import (
     metadata_response,
     remote_auth_response,
 )
-from zendesk_skill.utils.security import generate_markers, security_instructions, wrap_external_data, is_security_enabled, wrap_field_simple
+from zendesk_skill.utils.security import SECURITY_WORK_EXECUTOR, generate_markers, security_instructions, wrap_external_data, is_security_enabled, wrap_field_simple
 
 
 MCP_MIN_STREAMABLE_HTTP_VERSION = "1.8.0"
@@ -40,10 +39,7 @@ logger = logging.getLogger(__name__)
 # Security screening may lazily initialize the ONNX model.  A single shared
 # worker keeps that CPU-heavy work off the ASGI event loop and prevents
 # concurrent requests from initializing multiple model instances.
-_SECURITY_FORMATTING_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="zendesk-security",
-)
+_SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -987,6 +983,22 @@ async def _format_remote_result_async(result: dict) -> str:
     return await _run_security_formatter(_format_remote_result, result)
 
 
+async def _format_screened_talk_analytics_result(result: dict) -> str:
+    """Serialize the already-screened, bounded Talk result without screening twice."""
+    started = time.monotonic()
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _SECURITY_FORMATTING_EXECUTOR,
+            partial(_format_result, result),
+        )
+    finally:
+        logger.info(
+            "Talk response formatting completed elapsed_seconds=%.3f",
+            time.monotonic() - started,
+        )
+
+
 async def _format_trusted_remote_result_async(result: dict) -> str:
     """Format allowlisted auth metadata and screen its untrusted subtrees."""
     return await _run_security_formatter(_format_trusted_remote_result, result)
@@ -1124,8 +1136,14 @@ def create_remote_read_only_mcp() -> FastMCP:
     @remote.tool(name="zendesk_talk_analytics")
     async def remote_zendesk_talk_analytics(params: RemoteTalkAnalyticsInput) -> str:
         try:
-            result = await operations.get_talk_analytics(params.start_date, params.end_date, params.breakdown_by, _remote_output_path("talk_analytics"))
-            return await _format_remote_result_async(result)
+            result = await operations.get_talk_analytics(
+                params.start_date,
+                params.end_date,
+                params.breakdown_by,
+                _remote_output_path("talk_analytics"),
+                remote=True,
+            )
+            return await _format_screened_talk_analytics_result(result)
         except Exception as e:
             return _handle_remote_error(e)
 

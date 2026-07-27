@@ -10,6 +10,7 @@ To allowlist specific tickets:
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,12 @@ from prompt_security import (
     wrap_external_data,
     wrap_field,
     wrap_fields,
+)
+
+# Process-wide serialization prevents concurrent lazy ONNX initialization.
+SECURITY_WORK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="zendesk-security",
 )
 
 # Zendesk config path

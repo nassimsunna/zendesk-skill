@@ -1,3 +1,6 @@
+import asyncio
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -750,3 +753,109 @@ def test_talk_line_redacts_only_phone_numbers():
     assert minimized[1]["phone_number"] == "main-support"
     assert sanitized[0]["line"] == "[redacted]"
     assert sanitized[0]["phone_number"] == "[redacted]"
+
+
+def test_remote_talk_processing_is_bounded_and_wraps_each_exposed_string_once(tmp_path, monkeypatch):
+    from zendesk_skill import operations
+
+    wrapped = []
+
+    def record_wrapper(value, *args):
+        wrapped.append(value)
+        return {"secured": value}
+
+    monkeypatch.setattr(operations, "wrap_field_simple", record_wrapper)
+    calls = [{"id": f"call-{index}", "group_name": f"Group {index}"} for index in range(40)]
+    result = operations._process_talk_analytics(
+        calls, [], {}, {}, "2026-01-01", "2026-01-02", "group",
+        str(tmp_path / "talk.json"), True,
+    )
+
+    assert result["joined_count"] == 40
+    assert len(result["joined_calls_preview"]) == 25
+    assert result["joined_preview_truncated"] is True
+    assert result["joined_preview_remaining"] == 15
+    assert "calls" not in result and "legs" not in result and "joined_calls" not in result
+    assert "file_path" not in result
+    # Each exposed preview and breakdown string is screened once, never again
+    # by remote response formatting.
+    assert len(wrapped) == 65  # 40 complete breakdown keys + 25 preview fields.
+
+
+@pytest.mark.asyncio
+async def test_talk_worker_has_bounded_admission_and_releases_after_exception(monkeypatch):
+    from zendesk_skill import operations, talk
+
+    async def fake_calls(*args, **kwargs):
+        return {"calls": [], "metadata": {}}
+
+    async def fake_legs(*args, **kwargs):
+        return {"legs": [], "metadata": {}}
+
+    lock = threading.Lock()
+    active = maximum = attempts = 0
+
+    def processing(*args):
+        nonlocal active, maximum, attempts
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            attempts += 1
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        if attempts == 1:
+            raise RuntimeError("deliberate")
+        return {"read_only": True}
+
+    monkeypatch.setattr(operations, "_get_client", lambda: object())
+    monkeypatch.setattr(talk, "fetch_incremental_with_metadata", fake_calls)
+    monkeypatch.setattr(talk, "fetch_relevant_legs_for_calls", fake_legs)
+    monkeypatch.setattr(operations, "_process_talk_analytics", processing)
+    results = await asyncio.gather(
+        operations.get_talk_analytics("2026-01-01", "2026-01-02"),
+        operations.get_talk_analytics("2026-01-01", "2026-01-02"),
+        return_exceptions=True,
+    )
+
+    assert maximum == 1
+    assert isinstance(results[0], RuntimeError)
+    assert results[1] == {"read_only": True}
+
+
+@pytest.mark.asyncio
+async def test_talk_worker_releases_capacity_after_cancellation(monkeypatch):
+    from zendesk_skill import operations, talk
+
+    async def fake_calls(*args, **kwargs):
+        return {"calls": [], "metadata": {}}
+
+    async def fake_legs(*args, **kwargs):
+        return {"legs": [], "metadata": {}}
+
+    started = threading.Event()
+    release = threading.Event()
+    invocations = 0
+
+    def processing(*args):
+        nonlocal invocations
+        invocations += 1
+        if invocations == 1:
+            started.set()
+            assert release.wait(timeout=2)
+        return {"read_only": True}
+
+    monkeypatch.setattr(operations, "_get_client", lambda: object())
+    monkeypatch.setattr(talk, "fetch_incremental_with_metadata", fake_calls)
+    monkeypatch.setattr(talk, "fetch_relevant_legs_for_calls", fake_legs)
+    monkeypatch.setattr(operations, "_process_talk_analytics", processing)
+    first = asyncio.create_task(operations.get_talk_analytics("2026-01-01", "2026-01-02"))
+    await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+    first.cancel()
+    second = asyncio.create_task(operations.get_talk_analytics("2026-01-01", "2026-01-02"))
+    await asyncio.sleep(0.02)
+    assert invocations == 1
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert await asyncio.wait_for(second, timeout=1) == {"read_only": True}

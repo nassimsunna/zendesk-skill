@@ -3,8 +3,12 @@
 This module contains all Zendesk API interaction logic used by both
 the CLI and MCP server. All functions are async and return dicts.
 """
+import asyncio
+import logging
 import re
 import tempfile
+import time
+from functools import partial
 from pathlib import Path
 
 from zendesk_skill.client import (
@@ -25,11 +29,21 @@ from zendesk_skill.formatting import format_for_zendesk
 from zendesk_skill.queries import get_queries_for_tool
 from zendesk_skill.storage import save_response
 from zendesk_skill.utils.security import (
+    SECURITY_WORK_EXECUTOR,
     generate_markers,
     is_security_enabled,
     read_and_wrap_file,
     wrap_field_simple,
 )
+
+logger = logging.getLogger(__name__)
+
+# Talk analytics can initialize the ONNX-backed prompt-injection scanner.  Admit
+# only one post-processing job at a time so the executor cannot accumulate an
+# unbounded queue and two requests can never race model initialization.
+_TALK_ANALYTICS_EXECUTOR = SECURITY_WORK_EXECUTOR
+_TALK_ANALYTICS_ADMISSION = asyncio.Semaphore(1)
+TALK_JOINED_PREVIEW_LIMIT = 25
 
 # ---------------------------------------------------------------------------
 # Session-scoped security markers
@@ -1498,15 +1512,66 @@ async def get_talk_analytics(
     end_date: str,
     breakdown_by: str | None = None,
     output_path: str | None = None,
+    *,
+    remote: bool = False,
 ) -> dict:
-    """Retrieve calls and legs, join them, classify outcomes, and optionally break down results."""
-    from zendesk_skill.talk import CALLS_ENDPOINT, breakdown, fetch_incremental_with_metadata, fetch_relevant_legs_for_calls, join_calls_and_legs, summarize_leg
+    """Fetch Talk data asynchronously, then process it on the bounded worker."""
+    from zendesk_skill.talk import CALLS_ENDPOINT, fetch_incremental_with_metadata, fetch_relevant_legs_for_calls
 
     client = _get_client()
+    started = time.monotonic()
     calls_result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    logger.info("Talk calls fetch completed elapsed_seconds=%.3f", time.monotonic() - started)
     calls = calls_result["calls"]
+    started = time.monotonic()
     legs_result = await fetch_relevant_legs_for_calls(client, calls, start_date, end_date)
+    logger.info("Talk legs fetch completed elapsed_seconds=%.3f", time.monotonic() - started)
     legs = legs_result["legs"]
+
+    async with _TALK_ANALYTICS_ADMISSION:
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            _TALK_ANALYTICS_EXECUTOR,
+            partial(
+                _process_talk_analytics,
+                calls,
+                legs,
+                calls_result["metadata"],
+                legs_result["metadata"],
+                start_date,
+                end_date,
+                breakdown_by,
+                output_path,
+                remote,
+            ),
+        )
+        try:
+            # Shield the worker so cancellation does not release admission while
+            # CPU/model/file work is still running in its non-cancellable thread.
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                pass
+            raise
+
+
+def _process_talk_analytics(
+    calls,
+    legs,
+    calls_metadata,
+    legs_metadata,
+    start_date,
+    end_date,
+    breakdown_by,
+    output_path,
+    remote,
+) -> dict:
+    """Perform every synchronous Talk analytics step in the worker thread."""
+    from zendesk_skill.talk import breakdown, join_calls_and_legs, summarize_leg
+
+    processing_started = time.monotonic()
     rows = join_calls_and_legs(calls, legs)
     allowed_breakdowns = {"agent", "group", "date", "hour", "phone_line", "outcome"}
     breakdowns = {}
@@ -1526,7 +1591,7 @@ async def get_talk_analytics(
         "joined_calls": _minimize_talk_for_storage(rows),
         "leg_summaries": leg_summaries,
         "breakdowns": _minimize_talk_for_storage(breakdowns),
-        "metadata": {"calls": calls_result["metadata"], "legs": legs_result["metadata"]},
+        "metadata": {"calls": calls_metadata, "legs": legs_metadata},
         "read_only": True,
         "notes": [
             "Agent-answered calls require talk time plus a completed agent leg; completed alone is not enough.",
@@ -1535,4 +1600,28 @@ async def get_talk_analytics(
         ],
     }
     file_path, _ = save_response("talk_analytics", {"start_date": start_date, "end_date": end_date, "breakdown_by": breakdown_by}, payload, output_path=output_path)
-    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": _sanitize_talk_for_llm(breakdowns), "joined_calls": _sanitize_talk_for_llm(rows), "metadata": payload["metadata"], "file_path": str(file_path), "read_only": True}
+    screening_started = time.monotonic()
+    safe_breakdowns = _sanitize_talk_for_llm(breakdowns)
+    safe_rows = _sanitize_talk_for_llm(rows[:TALK_JOINED_PREVIEW_LIMIT] if remote else rows)
+    logger.info("Talk security screening completed elapsed_seconds=%.3f", time.monotonic() - screening_started)
+    result = {
+        "call_count": len(calls),
+        "leg_count": len(legs),
+        "joined_count": len(rows),
+        "breakdowns": safe_breakdowns,
+        "metadata": payload["metadata"],
+        "read_only": True,
+    }
+    if remote:
+        result.update({
+            "joined_calls_preview": safe_rows,
+            "joined_preview_count": len(safe_rows),
+            "joined_preview_limit": TALK_JOINED_PREVIEW_LIMIT,
+            "joined_preview_truncated": len(rows) > TALK_JOINED_PREVIEW_LIMIT,
+            "joined_preview_remaining": max(0, len(rows) - TALK_JOINED_PREVIEW_LIMIT),
+        })
+    else:
+        result["joined_calls"] = safe_rows
+        result["file_path"] = str(file_path)
+    logger.info("Talk analytics post-processing completed elapsed_seconds=%.3f", time.monotonic() - processing_started)
+    return result
