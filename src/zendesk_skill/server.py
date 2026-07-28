@@ -43,7 +43,40 @@ logger = logging.getLogger(__name__)
 # Backwards-compatible private name used by older integrations and tests.
 _SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
 
+_SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
 
+_TALK_REMOTE_RESULT_FIELDS = (
+    "call_count",
+    "leg_count",
+    "joined_count",
+    "breakdowns",
+    "metadata",
+    "read_only",
+    "joined_calls_preview",
+    "preview_truncated",
+    "preview_remaining_count",
+)
+
+
+def _format_screened_talk_analytics_result(result: dict) -> str:
+    """Serialize the already-screened remote Talk payload."""
+    return _format_result({key: result[key] for key in _TALK_REMOTE_RESULT_FIELDS})
+
+
+async def _format_screened_talk_analytics_result_async(result: dict) -> str:
+    """Serialize remote Talk analytics without blocking the ASGI event loop."""
+    started = time.perf_counter()
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            TALK_ANALYTICS_EXECUTOR,
+            partial(_format_screened_talk_analytics_result, result),
+        )
+    finally:
+        logger.info(
+            "Talk analytics response formatting completed in %.3fs",
+            time.perf_counter() - started,
+        )
 def _version_tuple(value: str) -> tuple[int, ...]:
     parts = []
     for part in value.split("."):
