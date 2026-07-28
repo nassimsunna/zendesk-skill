@@ -1,0 +1,114 @@
+name: Apply PR9 fixes
+
+on:
+  push:
+    branches:
+      - codex/fix-zendesk-talk-analytics-event-loop-issues
+    paths:
+      - .github/workflows/apply-pr9-fixes.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fixes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/fix-zendesk-talk-analytics-event-loop-issues
+          fetch-depth: 0
+
+      - name: Apply exact fixes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          server_path = Path("src/zendesk_skill/server.py")
+          server = server_path.read_text()
+
+          old_imports = """from zendesk_skill.executors import SECURITY_WORK_EXECUTOR, TALK_ANALYTICS_EXECUTOR
+          from zendesk_skill.executors import SECURITY_WORK_EXECUTOR
+          from zendesk_skill.client import ZendeskAuthError, ZendeskAPIError
+          """
+          new_imports = """from zendesk_skill import operations
+          from zendesk_skill.executors import SECURITY_WORK_EXECUTOR, TALK_ANALYTICS_EXECUTOR
+          from zendesk_skill.client import ZendeskAuthError, ZendeskAPIError
+          """
+          assert old_imports in server, "Expected broken import block was not found"
+          server = server.replace(old_imports, new_imports, 1)
+
+          duplicate_assignment = """_SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
+
+          _SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
+          """
+          assert duplicate_assignment in server, "Expected duplicate executor assignment was not found"
+          server = server.replace(
+              duplicate_assignment,
+              "_SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR\n",
+              1,
+          )
+
+          old_endpoint = '''    @remote.tool(name="zendesk_talk_analytics")
+              async def remote_zendesk_talk_analytics(params: RemoteTalkAnalyticsInput) -> str:
+                  try:
+                      result = await operations.get_talk_analytics(params.start_date, params.end_date, params.breakdown_by, _remote_output_path("talk_analytics"))
+                      started = time.perf_counter()
+                      response = _format_result({
+                          key: result[key]
+                          for key in (
+                              "call_count", "leg_count", "joined_count", "breakdowns",
+                              "metadata", "read_only", "joined_calls_preview",
+                              "preview_truncated", "preview_remaining_count",
+                          )
+                      })
+                      logger.info(
+                          "Talk analytics response formatting completed in %.3fs",
+                          time.perf_counter() - started,
+                      )
+                      return response
+                  except Exception as e:
+                      return _handle_remote_error(e)
+          '''
+          new_endpoint = '''    @remote.tool(name="zendesk_talk_analytics")
+              async def remote_zendesk_talk_analytics(params: RemoteTalkAnalyticsInput) -> str:
+                  try:
+                      result = await operations.get_talk_analytics(
+                          params.start_date,
+                          params.end_date,
+                          params.breakdown_by,
+                          _remote_output_path("talk_analytics"),
+                      )
+                      return await _format_screened_talk_analytics_result_async(result)
+                  except Exception as e:
+                      return _handle_remote_error(e)
+          '''
+          assert old_endpoint in server, "Expected synchronous Talk endpoint was not found"
+          server = server.replace(old_endpoint, new_endpoint, 1)
+          server_path.write_text(server)
+
+          test_path = Path("tests/test_talk_event_loop.py")
+          tests = test_path.read_text()
+          duplicated_test_call = '''    await operations.get_talk_analytics("2026-01-01", "2026-01-02")
+              await operations.get_talk_analytics("2026-01-01", "2026-01-02")
+              assert calls == 1
+          '''
+          corrected_test_call = '''    await operations.get_talk_analytics("2026-01-01", "2026-01-02")
+              assert calls == 1
+          '''
+          assert duplicated_test_call in tests, "Expected duplicated test call was not found"
+          tests = tests.replace(duplicated_test_call, corrected_test_call, 1)
+          test_path.write_text(tests)
+          PY
+
+      - name: Compile changed Python files
+        run: python -m py_compile src/zendesk_skill/server.py src/zendesk_skill/operations.py tests/test_talk_event_loop.py
+
+      - name: Commit and push fixes
+        run: |
+          git config user.name "chatgpt-fix-bot"
+          git config user.email "noreply@github.com"
+          git add src/zendesk_skill/server.py tests/test_talk_event_loop.py
+          git commit -m "Fix PR9 suggestion integration"
+          git push origin HEAD:codex/fix-zendesk-talk-analytics-event-loop-issues
