@@ -20,7 +20,7 @@ from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
-from zendesk_skill import operations
+from zendesk_skill.executors import SECURITY_WORK_EXECUTOR, TALK_ANALYTICS_EXECUTOR
 from zendesk_skill.executors import SECURITY_WORK_EXECUTOR
 from zendesk_skill.client import ZendeskAuthError, ZendeskAPIError
 from zendesk_skill.queries import execute_jq, get_query
