@@ -20,8 +20,8 @@ from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
+from zendesk_skill import operations
 from zendesk_skill.executors import SECURITY_WORK_EXECUTOR, TALK_ANALYTICS_EXECUTOR
-from zendesk_skill.executors import SECURITY_WORK_EXECUTOR
 from zendesk_skill.client import ZendeskAuthError, ZendeskAPIError
 from zendesk_skill.queries import execute_jq, get_query
 from zendesk_skill.storage import load_response
@@ -41,8 +41,6 @@ logger = logging.getLogger(__name__)
 # worker keeps that CPU-heavy work off the ASGI event loop and prevents
 # concurrent requests from initializing multiple model instances.
 # Backwards-compatible private name used by older integrations and tests.
-_SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
-
 _SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
 
 _TALK_REMOTE_RESULT_FIELDS = (
@@ -1161,21 +1159,13 @@ def create_remote_read_only_mcp() -> FastMCP:
     @remote.tool(name="zendesk_talk_analytics")
     async def remote_zendesk_talk_analytics(params: RemoteTalkAnalyticsInput) -> str:
         try:
-            result = await operations.get_talk_analytics(params.start_date, params.end_date, params.breakdown_by, _remote_output_path("talk_analytics"))
-            started = time.perf_counter()
-            response = _format_result({
-                key: result[key]
-                for key in (
-                    "call_count", "leg_count", "joined_count", "breakdowns",
-                    "metadata", "read_only", "joined_calls_preview",
-                    "preview_truncated", "preview_remaining_count",
-                )
-            })
-            logger.info(
-                "Talk analytics response formatting completed in %.3fs",
-                time.perf_counter() - started,
+            result = await operations.get_talk_analytics(
+                params.start_date,
+                params.end_date,
+                params.breakdown_by,
+                _remote_output_path("talk_analytics"),
             )
-            return response
+            return await _format_screened_talk_analytics_result_async(result)
         except Exception as e:
             return _handle_remote_error(e)
 

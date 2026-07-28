@@ -142,7 +142,6 @@ async def test_exposed_talk_payload_is_screened_once(monkeypatch, tmp_path):
     _install_fakes(monkeypatch, tmp_path)
     monkeypatch.setattr(operations, "_sanitize_talk_for_llm", screen)
     await operations.get_talk_analytics("2026-01-01", "2026-01-02")
-    await operations.get_talk_analytics("2026-01-01", "2026-01-02")
     assert calls == 1
 
 
