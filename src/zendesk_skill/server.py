@@ -6,7 +6,6 @@ import logging
 import os
 import stat
 import time
-from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version as package_version
 import tempfile
@@ -22,6 +21,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
 from zendesk_skill import operations
+from zendesk_skill.executors import SECURITY_WORK_EXECUTOR, TALK_ANALYTICS_EXECUTOR
 from zendesk_skill.client import ZendeskAuthError, ZendeskAPIError
 from zendesk_skill.queries import execute_jq, get_query
 from zendesk_skill.storage import load_response
@@ -40,12 +40,41 @@ logger = logging.getLogger(__name__)
 # Security screening may lazily initialize the ONNX model.  A single shared
 # worker keeps that CPU-heavy work off the ASGI event loop and prevents
 # concurrent requests from initializing multiple model instances.
-_SECURITY_FORMATTING_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="zendesk-security",
+# Backwards-compatible private name used by older integrations and tests.
+_SECURITY_FORMATTING_EXECUTOR = SECURITY_WORK_EXECUTOR
+
+_TALK_REMOTE_RESULT_FIELDS = (
+    "call_count",
+    "leg_count",
+    "joined_count",
+    "breakdowns",
+    "metadata",
+    "read_only",
+    "joined_calls_preview",
+    "preview_truncated",
+    "preview_remaining_count",
 )
 
 
+def _format_screened_talk_analytics_result(result: dict) -> str:
+    """Serialize the already-screened remote Talk payload."""
+    return _format_result({key: result[key] for key in _TALK_REMOTE_RESULT_FIELDS})
+
+
+async def _format_screened_talk_analytics_result_async(result: dict) -> str:
+    """Serialize remote Talk analytics without blocking the ASGI event loop."""
+    started = time.perf_counter()
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            TALK_ANALYTICS_EXECUTOR,
+            partial(_format_screened_talk_analytics_result, result),
+        )
+    finally:
+        logger.info(
+            "Talk analytics response formatting completed in %.3fs",
+            time.perf_counter() - started,
+        )
 def _version_tuple(value: str) -> tuple[int, ...]:
     parts = []
     for part in value.split("."):
@@ -694,7 +723,13 @@ async def zendesk_talk_analytics(params: TalkAnalyticsInput) -> str:
     """Join Talk calls to legs/tickets, classify outcomes, metrics, agent leg statuses, and breakdowns."""
     try:
         result = await operations.get_talk_analytics(params.start_date, params.end_date, params.breakdown_by, params.output_path)
-        return _format_result(result)
+        started = time.perf_counter()
+        response = _format_result(result)
+        logger.info(
+            "Talk analytics response formatting completed in %.3fs",
+            time.perf_counter() - started,
+        )
+        return response
     except Exception as e:
         return _handle_error(e)
 
@@ -1124,8 +1159,13 @@ def create_remote_read_only_mcp() -> FastMCP:
     @remote.tool(name="zendesk_talk_analytics")
     async def remote_zendesk_talk_analytics(params: RemoteTalkAnalyticsInput) -> str:
         try:
-            result = await operations.get_talk_analytics(params.start_date, params.end_date, params.breakdown_by, _remote_output_path("talk_analytics"))
-            return await _format_remote_result_async(result)
+            result = await operations.get_talk_analytics(
+                params.start_date,
+                params.end_date,
+                params.breakdown_by,
+                _remote_output_path("talk_analytics"),
+            )
+            return await _format_screened_talk_analytics_result_async(result)
         except Exception as e:
             return _handle_remote_error(e)
 

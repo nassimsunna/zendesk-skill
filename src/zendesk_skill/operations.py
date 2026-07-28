@@ -3,8 +3,12 @@
 This module contains all Zendesk API interaction logic used by both
 the CLI and MCP server. All functions are async and return dicts.
 """
+import asyncio
+import logging
 import re
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from zendesk_skill.client import (
@@ -22,6 +26,7 @@ from zendesk_skill.client import (
     save_slack_config,
 )
 from zendesk_skill.formatting import format_for_zendesk
+from zendesk_skill.executors import SECURITY_WORK_EXECUTOR, TALK_ANALYTICS_EXECUTOR
 from zendesk_skill.queries import get_queries_for_tool
 from zendesk_skill.storage import save_response
 from zendesk_skill.utils.security import (
@@ -62,6 +67,36 @@ TEXT_EXTENSIONS = {
 }
 
 MAX_SCAN_SIZE = 1_000_000  # 1 MB — files above this get CLI hint instead of inline scan
+
+logger = logging.getLogger(__name__)
+
+
+class _TalkAnalyticsAdmission:
+    """Cross-event-loop, cancellation-safe admission for the Talk worker.
+
+    An ``asyncio.Semaphore`` is bound to the loop that first uses it.  This
+    small controller instead keeps only loop-neutral state and performs the
+    wait cooperatively on whichever event loop owns the current request.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._active = False
+
+    async def acquire(self) -> None:
+        while True:
+            with self._guard:
+                if not self._active:
+                    self._active = True
+                    return
+            await asyncio.sleep(0.01)
+
+    def release(self) -> None:
+        with self._guard:
+            self._active = False
+
+
+_TALK_ANALYTICS_ADMISSION = _TalkAnalyticsAdmission()
 
 
 def _attachment_security_hint(path: Path) -> str:
@@ -1503,36 +1538,66 @@ async def get_talk_analytics(
     from zendesk_skill.talk import CALLS_ENDPOINT, breakdown, fetch_incremental_with_metadata, fetch_relevant_legs_for_calls, join_calls_and_legs, summarize_leg
 
     client = _get_client()
+    started = time.perf_counter()
     calls_result = await fetch_incremental_with_metadata(client, CALLS_ENDPOINT, "calls", start_date, end_date)
+    logger.info("Talk calls fetch completed in %.3fs", time.perf_counter() - started)
     calls = calls_result["calls"]
+    started = time.perf_counter()
     legs_result = await fetch_relevant_legs_for_calls(client, calls, start_date, end_date)
+    logger.info("Talk legs fetch completed in %.3fs", time.perf_counter() - started)
     legs = legs_result["legs"]
-    rows = join_calls_and_legs(calls, legs)
-    allowed_breakdowns = {"agent", "group", "date", "hour", "phone_line", "outcome"}
-    breakdowns = {}
-    if breakdown_by:
-        requested = [part.strip() for part in breakdown_by.split(",") if part.strip()]
-    else:
-        requested = sorted(allowed_breakdowns)
-    for name in requested:
-        if name not in allowed_breakdowns:
-            raise ValueError(f"Unsupported breakdown: {name}. Choose from {', '.join(sorted(allowed_breakdowns))}.")
-        breakdowns[name] = breakdown(rows, name)
 
-    leg_summaries = [summarize_leg(leg) for leg in legs]
-    payload = {
-        "calls": _minimize_talk_for_storage(calls),
-        "legs": _minimize_talk_for_storage(legs),
-        "joined_calls": _minimize_talk_for_storage(rows),
-        "leg_summaries": leg_summaries,
-        "breakdowns": _minimize_talk_for_storage(breakdowns),
-        "metadata": {"calls": calls_result["metadata"], "legs": legs_result["metadata"]},
-        "read_only": True,
-        "notes": [
-            "Agent-answered calls require talk time plus a completed agent leg; completed alone is not enough.",
-            "Original Zendesk completion status is preserved in classification.zendesk_completion_status.",
-            "IVR data is limited to fields returned by Zendesk; this does not provide a complete IVR keypress path.",
-        ],
-    }
-    file_path, _ = save_response("talk_analytics", {"start_date": start_date, "end_date": end_date, "breakdown_by": breakdown_by}, payload, output_path=output_path)
-    return {"call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows), "breakdowns": _sanitize_talk_for_llm(breakdowns), "joined_calls": _sanitize_talk_for_llm(rows), "metadata": payload["metadata"], "file_path": str(file_path), "read_only": True}
+    def process() -> dict:
+        processing_started = time.perf_counter()
+        rows = join_calls_and_legs(calls, legs)
+        allowed = {"agent", "group", "date", "hour", "phone_line", "outcome"}
+        requested = ([part.strip() for part in breakdown_by.split(",") if part.strip()]
+                     if breakdown_by else sorted(allowed))
+        breakdowns = {}
+        for name in requested:
+            if name not in allowed:
+                raise ValueError(
+                    f"Unsupported breakdown: {name}. Choose from {', '.join(sorted(allowed))}."
+                )
+            breakdowns[name] = breakdown(rows, name)
+        payload = {
+            "calls": _minimize_talk_for_storage(calls),
+            "legs": _minimize_talk_for_storage(legs),
+            "joined_calls": _minimize_talk_for_storage(rows),
+            "leg_summaries": [summarize_leg(leg) for leg in legs],
+            "breakdowns": _minimize_talk_for_storage(breakdowns),
+            "metadata": {"calls": calls_result["metadata"], "legs": legs_result["metadata"]},
+            "read_only": True,
+        }
+        persistence_started = time.perf_counter()
+        save_response(
+            "talk_analytics",
+            {"start_date": start_date, "end_date": end_date, "breakdown_by": breakdown_by},
+            payload,
+            output_path=output_path,
+        )
+        logger.info("Talk analytics persistence completed in %.3fs", time.perf_counter() - persistence_started)
+        preview = rows[:25]
+        exposed = {"breakdowns": breakdowns, "joined_calls_preview": preview}
+        security_started = time.perf_counter()
+        screened = SECURITY_WORK_EXECUTOR.submit(_sanitize_talk_for_llm, exposed).result()
+        logger.info("Talk analytics security screening completed in %.3fs", time.perf_counter() - security_started)
+        logger.info("Talk analytics processing completed in %.3fs", time.perf_counter() - processing_started)
+        return {
+            "call_count": len(calls), "leg_count": len(legs), "joined_count": len(rows),
+            **screened,
+            "metadata": payload["metadata"], "read_only": True,
+            "preview_truncated": len(rows) > 25,
+            "preview_remaining_count": max(0, len(rows) - 25),
+        }
+
+    await _TALK_ANALYTICS_ADMISSION.acquire()
+    try:
+        concurrent_future = TALK_ANALYTICS_EXECUTOR.submit(process)
+    except BaseException:
+        _TALK_ANALYTICS_ADMISSION.release()
+        raise
+    # The callback is attached to the loop-neutral future.  It therefore runs
+    # even if request cancellation closes its event loop before work finishes.
+    concurrent_future.add_done_callback(lambda _future: _TALK_ANALYTICS_ADMISSION.release())
+    return await asyncio.wrap_future(concurrent_future)
