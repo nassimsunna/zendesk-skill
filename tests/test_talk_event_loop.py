@@ -142,4 +142,78 @@ async def test_exposed_talk_payload_is_screened_once(monkeypatch, tmp_path):
     _install_fakes(monkeypatch, tmp_path)
     monkeypatch.setattr(operations, "_sanitize_talk_for_llm", screen)
     await operations.get_talk_analytics("2026-01-01", "2026-01-02")
+    await operations.get_talk_analytics("2026-01-01", "2026-01-02")
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_executor_submission_failure_releases_admission(monkeypatch, tmp_path):
+    _install_fakes(monkeypatch, tmp_path)
+    original_submit = operations.TALK_ANALYTICS_EXECUTOR.submit
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("submit failed")
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(operations.TALK_ANALYTICS_EXECUTOR, "submit", fail_once)
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        await operations.get_talk_analytics("2026-01-01", "2026-01-02")
+
+    result = await asyncio.wait_for(
+        operations.get_talk_analytics("2026-01-01", "2026-01-02"),
+        1,
+    )
+    assert result["joined_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_large_remote_talk_serialization_does_not_block_event_loop(monkeypatch):
+    from zendesk_skill import server
+
+    serialization_started = threading.Event()
+    release_serialization = threading.Event()
+    original_format_result = server._format_result
+
+    def slow_format_result(value):
+        serialization_started.set()
+        assert release_serialization.wait(timeout=2)
+        return original_format_result(value)
+
+    monkeypatch.setattr(server, "_format_result", slow_format_result)
+    result = {
+        "call_count": 1,
+        "leg_count": 1,
+        "joined_count": 1,
+        "breakdowns": {
+            "phone_line": [
+                {"key": f"line-{index}", "count": 1}
+                for index in range(10_000)
+            ]
+        },
+        "metadata": {},
+        "read_only": True,
+        "joined_calls_preview": [],
+        "preview_truncated": False,
+        "preview_remaining_count": 0,
+    }
+
+    formatting = asyncio.create_task(
+        server._format_screened_talk_analytics_result_async(result)
+    )
+    await asyncio.wait_for(
+        asyncio.to_thread(serialization_started.wait),
+        timeout=1,
+    )
+
+    try:
+        tick_started = time.perf_counter()
+        await asyncio.sleep(0)
+        assert time.perf_counter() - tick_started < 0.05
+    finally:
+        release_serialization.set()
+        await formatting
