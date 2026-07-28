@@ -1592,7 +1592,11 @@ async def get_talk_analytics(
         }
 
     await _TALK_ANALYTICS_ADMISSION.acquire()
-    concurrent_future = TALK_ANALYTICS_EXECUTOR.submit(process)
+    try:
+        concurrent_future = TALK_ANALYTICS_EXECUTOR.submit(process)
+    except BaseException:
+        _TALK_ANALYTICS_ADMISSION.release()
+        raise
     # The callback is attached to the loop-neutral future.  It therefore runs
     # even if request cancellation closes its event loop before work finishes.
     concurrent_future.add_done_callback(lambda _future: _TALK_ANALYTICS_ADMISSION.release())
